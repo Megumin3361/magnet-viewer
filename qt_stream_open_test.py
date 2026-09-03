@@ -112,6 +112,15 @@ def main():
     except Exception as e:
         print(f"[SKIP] PySide6 QtMultimedia 不可用（{e}），Qt 开播验证跳过")
         return 2    # 退出码 2 = 显式跳过（区别于「通过=0 / 失败=1」假绿）
+    # 后端可用性探针：QMediaPlayer 能 import 不代表多媒体栈可用。
+    # 无音频/显示会话的环境（无头 CI、服务器）实例化即 ResourceError
+    # 'Not available'，此时整组用例必红却与代码无关 —— 显式 SKIP，
+    # 与既有「不假绿也不假红」的约定保持一致。
+    probe = _m()
+    if probe.error() != _m.NoError:
+        print(f"[SKIP] Qt 多媒体后端不可用（{probe.errorString()}），Qt 开播验证跳过")
+        return 2
+    probe.deleteLater()
     tmp = tempfile.mkdtemp(prefix="mv_qtopen_")
     try:
         disk = os.path.join(tmp, "demo.mp4")
