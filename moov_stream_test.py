@@ -1,0 +1,185 @@
+"""moov 尾部优先流式修复的端到端验证（无 GUI，可离线运行）。
+
+背景：普通 MP4/MOV 的 moov 索引块在文件尾部；边下边播时若只下载了文件头，
+FFmpeg 探测会报 `moov atom not found` / `Invalid data found when processing input`。
+
+本脚本：
+1) 用 ffmpeg（PATH / imageio-ffmpeg 自带二进制）生成一个**真实且 moov 在尾部**
+   的 MP4（testsrc → mpeg4，约 6 MB）；
+2) 以本地 HTTP 流服务模拟三种下载状态并调用 ffprobe/ffmpeg 实际探测：
+   - 仅头部 64KB（旧行为）        → 必须失败（复现用户报错）；
+   - 头部 + 尾部 4MB 窗口（修复后）→ 必须成功（可边下边播）；
+   - 全部下载                     → 必须成功（基线）。
+用法：python moov_stream_test.py
+"""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from core.models import PieceMap  # noqa: E402
+from core.stream_server import StreamServer  # noqa: E402
+
+PL = 16 * 1024
+HEAD_BYTES = 64 * 1024
+TAIL_BYTES = 4 * 1024 * 1024
+
+
+def find_ffmpeg_exe() -> str | None:
+    """定位可用的 ffmpeg.exe（不含 ffprobe）。支持 MV_FFMPEG 环境变量覆盖。"""
+    env = os.environ.get("MV_FFMPEG")
+    if env and os.path.isfile(env) and "ffprobe" not in os.path.basename(env).lower():
+        return env
+    if shutil.which("ffmpeg"):
+        return shutil.which("ffmpeg")
+    try:
+        import imageio_ffmpeg  # pip install imageio-ffmpeg，自带静态 ffmpeg.exe
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def find_probe_tool() -> tuple[str, str] | None:
+    """返回 (类型, 可执行路径)：优先 ffprobe，其次 ffmpeg。"""
+    env = os.environ.get("MV_FFMPEG")
+    if env and os.path.isfile(env):
+        name = os.path.basename(env).lower()
+        return ("ffprobe" if "ffprobe" in name else "ffmpeg", env)
+    if shutil.which("ffprobe"):
+        return ("ffprobe", shutil.which("ffprobe"))
+    exe = find_ffmpeg_exe()
+    return ("ffmpeg", exe) if exe else None
+
+
+def make_tail_moov_mp4(path: str) -> bool:
+    """用 ffmpeg 生成 moov 在尾部（默认布局）的真实 MP4，大小 > 5MB。
+
+    testsrc 合成画面本身码率极低，需用 CBR（minrate/maxrate/bufsize）
+    强制到 ~2.5 Mbps 才能产出 9MB 量级的文件，保证测试里
+    “头部 64KB + 尾部 4MB”两个窗口之间存在真实空洞。
+    """
+    exe = find_ffmpeg_exe()
+    if exe is None:
+        return False
+    cmd = [exe, "-y", "-f", "lavfi", "-i",
+           "testsrc=size=640x360:rate=15:duration=30",
+           "-c:v", "mpeg4", "-b:v", "2500k",
+           "-minrate", "2500k", "-maxrate", "2500k", "-bufsize", "5000k",
+           "-an", path]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        return False
+    return (r.returncode == 0
+            and os.path.isfile(path)
+            and os.path.getsize(path) > 5 * 1024 * 1024)
+
+
+def probe(url: str, timeout: float = 20.0) -> tuple[int, str]:
+    """用 ffprobe / ffmpeg 探测媒体，返回 (退出码, 输出文本)。"""
+    tool = find_probe_tool()
+    if tool is None:
+        return -1, "no ffprobe/ffmpeg available"
+    kind, exe = tool
+    if kind == "ffprobe":
+        cmd = [exe, "-v", "error", "-show_entries",
+               "format=duration", "-of", "default=nw=1", url]
+    else:
+        # ffmpeg 7.x 无输出文件会报 “At least one output file must be specified”；
+        # 用 null muxer + 0 帧输出：只验证输入能否打开，不触发解码
+        cmd = [exe, "-v", "error", "-i", url,
+               "-f", "null", "-frames:v", "0", "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return -1, "probe timeout"
+
+
+def run_case(tmp: str, name: str, have: set[int],
+             expect_ok: bool, fill_on_demand: bool = False) -> tuple[bool, str]:
+    """以给定分块可用性启动流服务并探测。
+
+    fill_on_demand=True 时模拟真实调度器：播放器（FFmpeg）请求哪段，
+    demand_cb 就把那段的缺失分块补上（对应 PreviewScheduler.request_range），
+    验证「点播 + 等待」能否让探测成功。
+    """
+    disk = os.path.join(tmp, "demo.mp4")
+    size = os.path.getsize(disk)
+    pm = PieceMap(PL, 0, 0, (size - 1) // PL, size, have.__contains__)
+
+    def demand(path, start, end_excl):
+        if not fill_on_demand:
+            return
+        first, last = start // PL, max(0, end_excl - 1) // PL
+
+        def fill():
+            time.sleep(0.15)          # 模拟分块陆续到达
+            have.update(range(first, last + 1))
+        threading.Thread(target=fill, daemon=True).start()
+
+    srv = StreamServer(tmp, pieces_cb=lambda p: pm if p == disk else None,
+                       demand_cb=demand, wait_timeout=8.0)
+    srv.start()
+    try:
+        rc, out = probe(srv.url_for("demo.mp4"))
+    finally:
+        srv.shutdown()
+    ok = (rc == 0) == expect_ok
+    tag = "通过" if ok else "失败"
+    print(f"[{name}] {'期望可开' if expect_ok else '期望打不开'} → "
+          f"退出码 {rc}：{out[:120]}  [{tag}]")
+    return ok, out
+
+
+def main():
+    if find_probe_tool() is None:
+        print("! 未找到 ffprobe/ffmpeg，跳过探测验证（HTTP 行为仍由 smoke_test 覆盖）")
+        return 0
+    tmp = tempfile.mkdtemp(prefix="mv_moov_")
+    try:
+        disk = os.path.join(tmp, "demo.mp4")
+        if not make_tail_moov_mp4(disk):
+            print("! 无法用 ffmpeg 生成测试视频，跳过（HTTP 行为仍由 smoke_test 覆盖）")
+            return 0
+        size = os.path.getsize(disk)
+        with open(disk, "rb") as f:
+            raw = f.read()
+        moov_pos = raw.find(b"moov")
+        print(f"[0] 真实尾部-moov MP4：{size / 1024 / 1024:.1f} MB，"
+              f"moov 偏移 {moov_pos}（{size - moov_pos} B 距末尾）→ "
+              f"尾部 {TAIL_BYTES // 1024 // 1024} MB 窗口应覆盖")
+        assert moov_pos >= 0 and size - moov_pos <= TAIL_BYTES, \
+            "moov 未落在尾部 4MB 窗口内"
+
+        # 任务 A：仅头部 64KB（旧行为）→ 必须失败（复现 moov atom not found）
+        head_only = set(range(0, HEAD_BYTES // PL))
+        ok_a, _ = run_case(tmp, "A 仅头部", head_only, expect_ok=False)
+
+        # 任务 B：头部 + 尾部窗口（修复后）→ 必须成功，可边下边播
+        tail_first = (max(0, (size - TAIL_BYTES)) + PL - 1) // PL
+        have_b = set(range(0, HEAD_BYTES // PL))
+        have_b |= set(range(tail_first, (size - 1) // PL + 1))
+        # 中间是空洞，靠 demand_cb 模拟调度器按需补拉（真实链路即此行为）
+        ok_b, _ = run_case(tmp, "B 头+尾窗口+按需补拉", have_b,
+                           expect_ok=True, fill_on_demand=True)
+
+        # 任务 C：全部下载（基线）→ 必须成功
+        all_pieces = set(range(0, (size - 1) // PL + 1))
+        ok_c, _ = run_case(tmp, "C 全部下载", all_pieces, expect_ok=True)
+
+        ok = ok_a and ok_b and ok_c
+        print("\n=== moov 尾部优先验证" + ("全部通过" if ok else "未通过") + " ===")
+        return 0 if ok else 1
+    finally:
+        time.sleep(0.2)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

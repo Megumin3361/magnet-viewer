@@ -1,0 +1,83 @@
+"""文件树视图：目录层级 + 大小/占比 + 双击预览。"""
+from __future__ import annotations
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QStandardItem, QStandardItemModel
+from PySide6.QtWidgets import QTreeView
+
+from core.models import ParseResult, TorrentFile, human_size
+
+
+class FileTreeWidget(QTreeView):
+    file_activated = Signal(object)  # TorrentFile
+
+    COL_NAME, COL_SIZE, COL_RATIO = 0, 1, 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._model = QStandardItemModel(0, 3, self)
+        self._model.setHorizontalHeaderLabels(["名称", "大小", "占比"])
+        self.setModel(self._model)
+        self.setUniformRowHeights(True)
+        self.setExpandsOnDoubleClick(False)
+        self.doubleClicked.connect(self._on_double_clicked)
+        header = self.header()
+        header.resizeSection(0, 460)
+        header.resizeSection(1, 110)
+        header.setStretchLastSection(True)
+
+    @staticmethod
+    def _make_row(text: str, size_text: str, ratio_text: str) -> list:
+        """构造完整三列行：名称 / 大小 / 占比。"""
+        name_item = QStandardItem(text)
+        name_item.setEditable(False)
+        size_item = QStandardItem(size_text)
+        size_item.setEditable(False)
+        size_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        ratio_item = QStandardItem(ratio_text)
+        ratio_item.setEditable(False)
+        ratio_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        return [name_item, size_item, ratio_item]
+
+    def populate(self, result: ParseResult):
+        self._model.removeRows(0, self._model.rowCount())
+        dir_items: dict[str, QStandardItem] = {}
+        root = self._model.invisibleRootItem()
+        total = result.total_size or 1
+
+        # 单文件种子的 path 不含分隔符，split("/") 后自然平铺，无需额外判定
+        for f in result.view_files:
+            parts = f.path.split("/")
+            parent = root
+            acc = ""
+            for seg in parts[:-1]:
+                acc = f"{acc}/{seg}" if acc else seg
+                if acc not in dir_items:
+                    dsize = sum(x.size for x in result.view_files
+                                if x.path.startswith(acc + "/"))
+                    row = self._make_row(
+                        f"[目录] {seg}", human_size(dsize),
+                        f"{dsize / total * 100:.1f}%")
+                    parent.appendRow(row)          # 关键：目录行必须挂到父节点
+                    dir_items[acc] = row[0]
+                parent = dir_items[acc]
+            icon = "🎬" if f.is_video else ("🖼" if f.is_image else "📄")
+            row = self._make_row(f"{icon} {f.name}", human_size(f.size),
+                                 f"{f.size / total * 100:.1f}%")
+            row[0].setData(f, Qt.UserRole)
+            parent.appendRow(row)
+
+        # 注意：多文件种子常见 root/季集/文件 三级结构，仅 expandToDepth(0)
+        # 会让二级目录保持折叠 —— 用户会看到"文件树里没有文件"。
+        if len(result.view_files) <= 3000:
+            self.expandAll()
+        else:  # 超大种子避免一次性展开卡顿
+            self.expandToDepth(2)
+
+    def _on_double_clicked(self, index):
+        item = self._model.itemFromIndex(index.siblingAtColumn(0))
+        if item is None:
+            return
+        f = item.data(Qt.UserRole)
+        if isinstance(f, TorrentFile) and f.is_previewable:
+            self.file_activated.emit(f)

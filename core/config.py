@@ -1,0 +1,111 @@
+"""应用设置：QSettings 持久化 + libtorrent 代理配置映射。"""
+from __future__ import annotations
+
+import json
+
+from PySide6.QtCore import QSettings
+
+RECENT_LIMIT = 15
+
+DEFAULTS: dict = {
+    "proxy_type": "none",          # none | socks5 | http
+    "proxy_host": "",
+    "proxy_port": 1080,
+    "proxy_user": "",
+    "proxy_pass": "",
+    "proxy_peer": True,            # peer 连接也走代理（隐私关键项）
+    "metadata_timeout": 90,        # 磁力链元数据获取超时（秒）
+    "cache_dir": "",               # 空 = 系统临时目录/magnet_viewer_cache
+    "clear_cache_on_exit": False,  # 退出时清理预览缓存
+}
+
+_TYPES: dict = {
+    "proxy_port": int,
+    "metadata_timeout": int,
+    "proxy_peer": bool,
+    "clear_cache_on_exit": bool,
+}
+
+# libtorrent settings_pack::proxy_type_t 的整型值（2.1.x 仍是稳定枚举）
+LT_PROXY_TYPES = {"none": 0, "socks4": 1, "socks5": 2,
+                  "socks5_pw": 3, "http": 4, "http_pw": 5}
+
+
+class AppConfig:
+    """QSettings 封装：读写用户设置（Windows 下存注册表）。"""
+
+    def __init__(self):
+        self.q = QSettings("Bitseed", "MagnetViewer")
+
+    def get(self, key: str):
+        default = DEFAULTS[key]
+        t = _TYPES.get(key, str)
+        try:
+            return self.q.value(key, default, type=t)
+        except TypeError:
+            return default
+
+    def set(self, key: str, value):
+        self.q.setValue(key, value)
+        self.q.sync()
+
+    def as_dict(self) -> dict:
+        return {k: self.get(k) for k in DEFAULTS}
+
+    # ---- 派生配置 ----
+
+    def proxy(self) -> dict:
+        """返回给 libtorrent 用的代理配置（dict 形式，见 lt_proxy_settings）。"""
+        return {
+            "type": self.get("proxy_type"),
+            "host": self.get("proxy_host"),
+            "port": self.get("proxy_port"),
+            "user": self.get("proxy_user"),
+            "pass": self.get("proxy_pass"),
+            "peer": self.get("proxy_peer"),
+        }
+
+    # ---- 解析历史（JSON 字符串存储，规避 QVariant 列表类型差异） ----
+
+    def recent(self) -> list:
+        try:
+            return list(json.loads(self.q.value("recent", "[]")))
+        except (TypeError, ValueError):
+            return []
+
+    def push_recent(self, item: str) -> list:
+        """记录一次解析输入（去重、置顶、限量）；过长的磁力链不入库。"""
+        item = (item or "").strip()
+        if not item or len(item) > 2048:
+            return self.recent()
+        items = [x for x in self.recent() if x != item]
+        items.insert(0, item)
+        items = items[:RECENT_LIMIT]
+        self.q.setValue("recent", json.dumps(items, ensure_ascii=False))
+        self.q.sync()
+        return items
+
+
+def lt_proxy_settings(proxy: dict | None) -> dict:
+    """应用代理配置 → libtorrent settings 键值对（纯函数，便于测试）。
+
+    未启用代理或主机为空时显式回落为直连（proxy_type=0）。
+    带账号密码时自动使用 socks5_pw / http_pw 类型。
+    """
+    p = proxy or {}
+    t = str(p.get("type", "none") or "none").lower()
+    host = str(p.get("host") or "").strip()
+    if t not in ("socks5", "http") or not host:
+        return {"proxy_type": LT_PROXY_TYPES["none"],
+                "proxy_peer_connections": False}
+    user, password = str(p.get("user") or ""), str(p.get("pass") or "")
+    if user:
+        t = {"socks5": "socks5_pw", "http": "http_pw"}[t]
+    return {
+        "proxy_type": LT_PROXY_TYPES[t],
+        "proxy_hostname": host,
+        "proxy_port": int(p.get("port") or 1080),
+        "proxy_peer_connections": bool(p.get("peer", True)),
+        "proxy_tracker_connections": True,
+        **({"proxy_username": user, "proxy_password": password} if user else {}),
+    }
