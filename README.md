@@ -45,10 +45,12 @@ python -m venv .venv
 magnet-viewer/
 ├── main.py               # 入口
 ├── core/
-│   ├── parser.py         # bencode 编解码 + .torrent / magnet 解析
-│   ├── fetcher.py        # libtorrent 会话管理（元数据获取、超时看门狗）
-│   ├── scheduler.py      # 预览调度：单文件锁定 + 顺序分块 + 索引块优先
-│   ├── stream_server.py  # 本地 HTTP 流服务（127.0.0.1 + Range）
+│   ├── parser.py         # bencode 编解码（含大小/深度/整数 DoS 上限）+ .torrent / magnet 解析
+│   ├── fetcher.py        # libtorrent 会话管理（元数据获取、超时看门狗、代理、资源清理）
+│   ├── scheduler.py      # 预览调度：单文件锁定 + 顺序分块 + 索引块优先 + 按需补拉
+│   ├── stream_server.py  # 本地 HTTP 流服务（127.0.0.1 + Range + token/Host 鉴权）
+│   ├── cache_guard.py    # 缓存目录守卫（防误删用户数据目录）
+│   ├── logutil.py        # 统一日志（滚动 1MB×3，可关闭，绝不因日志抛异常）
 │   ├── models.py         # 数据模型
 │   └── config.py         # QSettings 持久化 + 代理/历史映射
 ├── ui/
@@ -59,6 +61,8 @@ magnet-viewer/
 │   ├── gallery.py        # 图片画廊
 │   ├── status_panel.py   # 状态面板
 │   └── settings_dialog.py# 设置对话框（代理 / 超时 / 缓存）
+├── REVIEW.md             # 上一轮全面审查报告（含修复记录）
+├── audit_report.md       # 本轮团队全面审查报告与修复进度
 ├── smoke_test.py         # 无 GUI 冒烟测试（python smoke_test.py）
 ├── local_magnet_test.py  # 本机闭环验证：做种端 + 磁力链解析 + 边下边播（无需外网）
 ├── moov_stream_test.py   # moov 尾部优先端到端验证（ffprobe/ffmpeg 实际探测，无 GUI）
@@ -73,16 +77,19 @@ magnet-viewer/
 
 | 验证项 | 结果 |
 |--------|------|
-| `smoke_test.py`：解析 / **本地种子注入 cache_dir** / **路径穿越防护** / Range 流服务 / 前缀钳制 / **中文·特殊字符文件名往返** / 分块级可用性 / 尾部索引窗口 / **点播+等待** / **代理配置映射** / **会话启动参数** / 模块导入 | 通过 |
+| `smoke_test.py`：解析 / **本地种子注入 cache_dir** / **路径穿越防护** / **bencode 防御（深度炸弹·超长整数·超长长度字段）** / **鉴权（无 token·伪造 Host → 403）** / Range 流服务 / 前缀钳制 / **中文·特殊字符文件名往返** / 分块级可用性 / 尾部索引窗口 / **点播+等待** / **代理配置映射（含 tracker 重置）** / **会话启动参数** / 模块导入 | 通过 |
 | `local_magnet_test.py`：磁力链 → 元数据 → 单文件顺序下载 | 通过（元数据 1.0s、info_hash 一致、900 KB 缓冲至 100%、磁盘字节数一致） |
-| `moov_stream_test.py`（ffprobe/ffmpeg 实测） | 通过：A 仅头部→打不开（复现 moov not found）；B 头+尾+**按需补拉**→可探测；C 全量→可探测 |
-| `qt_stream_open_test.py`（QMediaPlayer FFmpeg 后端 offscreen 实测） | 通过：A 仅头部→`FormatError`（即用户遇到的 moov atom not found）；B 头+尾+按需补拉→`LoadedMedia` 成功开播；C 全量→成功 |
+| `moov_stream_test.py`（ffprobe/ffmpeg 实测，需 imageio-ffmpeg，缺失时退出码 2=SKIP） | 通过：A 仅头部→打不开（复现 moov not found）；B 头+尾+**按需补拉**→可探测；C 全量→可探测 |
+| `qt_stream_open_test.py`（QMediaPlayer FFmpeg 后端 offscreen 实测，依赖同上） | 通过：A 仅头部→`FormatError`（即用户遇到的 moov atom not found）；B 头+尾+按需补拉→`LoadedMedia` 成功开播；C 全量→成功 |
 | GUI 无头启动 | 通过（主窗口构造、会话与流服务启动、退出码 0） |
-| `gui_feature_test.py`（offscreen 实测 24 项） | 通过：主窗口实例化 / 拖放接受·拒绝 / 输入历史（置顶去重、上限 15、持久化读回）/ 文件树（嵌套目录三级展开、无折叠、无 `.pad`、叶子数与可见文件数一致）/ **磁盘路径映射键为绝对路径且可命中** |
-| `single_file_test.py`：单文件种子 × 本地种子/磁力链两条入口 | 通过（12/12）：路径层级、`file_disk_path` 落点、流服务按 `f.path` 供给 206 |
-| `local_torrent_test.py`：本地 .torrent 闭环 | 通过（9/9）：`cache_dir` 注入、路径映射键为绝对路径、流服务联动返回字节与磁盘一致 |
+| `gui_feature_test.py`（offscreen 实测 40 项） | 通过：主窗口实例化 / **设置接线（默认下载目录·并发数生效、流服务多根）** / 拖放接受·拒绝 / 输入历史（置顶去重、上限 15、持久化读回、**测试后恢复不污染用户注册表**）/ 文件树（嵌套目录三级展开、无折叠、无 `.pad`、叶子数与可见文件数一致）/ **磁盘路径映射键为绝对路径且可命中** / **清理缓存保留名单（downloads/.tasks.json/.resume 不误删）** / **画廊按 save_subdir 隔离路径加载大图** |
+| `single_file_test.py`：单文件种子 × 本地种子/磁力链两条入口 | 通过（12/12）：路径层级、`file_disk_path` 落点、流服务按 `f.path` 供给 206（目录隔离后断言随 `.preview/<ih>/` 布局更新，接口未变） |
+| `local_torrent_test.py`：本地 .torrent 闭环 | 通过（9/9）：`cache_dir` 注入、路径映射键为绝对路径、流服务联动返回字节与磁盘一致（同上随布局更新） |
+| `download_mgr_test.py`：下载管理模块验收（MVP 7 + 增强 2 + 边界 5 + 流服务安全） | **通过（79/79，退出码 0）**：添加磁力链→下载中 / 暂停（5s 磁盘字节快照不变）/ 恢复（字节续增、进度单调）/ 删除任务（目录释放、重添无残留）/ 退出重启续传（`.tasks.json`+fastresume 读回、上传增量证不重下）/ 完成（落盘=声明值）/ 双任务并发 100% / 限速 ±20% / 边界（重复 hash·per-task 看门狗·防穿越·resume 损坏重建·缓存被清不崩溃）/ 下载中任务流服务安全（分块级可用性，绝不整文件喂零数据） |
 | `live_test.py`：公网 DHT | **沙箱内不可用** —— 该环境仅允许 HTTP(S) 走代理，BT/UDP 出站被屏蔽（`dht_nodes` 恒为 0）。请在正常 BT 网络下执行 `python live_test.py` 复核。 |
 
+> 测试退出码约定：`0`=通过，`1`=失败，`2`=SKIP（依赖缺失时显式跳过，绝不假装通过）。
+> 一键回归：`python regression_run.py`（7 套旧测试全量汇总退出码；下载管理模块验收单独跑 `python download_mgr_test.py`）。
 > 测试覆盖策略：按**数据入口路径**（本地种子 / 磁力链；单文件 / 多文件 / 混合 v2）铺排，而非仅按功能模块——历史上三个缺陷都源于同一功能的不同入口未各自覆盖。详见 `REVIEW.md`。
 
 ## 已修复问题
@@ -95,6 +102,9 @@ magnet-viewer/
 6. **本地流服务目录穿越（安全修复）**。两处缺陷：
    - 恶意种子可声明 `path: ["..","..","Windows","win.ini"]` 或绝对路径，旧代码在 `file_disk_path()` 中原样拼接，路径会逃出缓存目录。修复：新增 `core.models.safe_rel_path()`，逐级丢弃 `.`/`..`/空段、剥离盘符与根前缀、把分隔符与 Windows 非法字符替换为下划线；`parser` 与 `fetcher` 两条路径构造链路均已接入。
    - 流服务的越界校验用 `fp.startswith(root)`，会把**同前缀兄弟目录**误判为合法（`C:\...\cacheT` 与 `C:\...\cacheT_evil`）。实测证明旧校验对 `/../cacheT_evil/secret.mp4` 返回 True 并放行。修复：改用 `os.path.commonpath()` + `normcase` 的 `_is_within()`。
+7. **「清理缓存」误删用户下载数据（数据安全修复）**。设置对话框「立即清理缓存」先经主窗口保留名单清预览缓存后，又用 `_rmtree_quiet` **无名单清空整个缓存目录**——`downloads/`（已下载文件）、`.tasks.json`（任务清单）、`.resume/`（续传数据）全被删除。修复：清理统一收敛到 `core.cache_guard.clear_cache_contents()`（保留名单：downloads/.tasks.json/.resume/受管标记），所有清理入口（对话框/退出清理）共用。
+8. **画廊图片在任务隔离布局下永不显示（功能失效修复）**。目录隔离改造后任务落盘 `cache_dir/.preview/<ih>/` 或 `downloads/<ih>/`，而 `ui/gallery.py` 仍按 `cache_dir` 平铺拼路径 → 已下载图片永远显示"下载中…"。修复：新增 `core.models.disk_root()`（`save_subdir` 相对时拼接、绝对时原样使用），画廊与主窗口的磁盘键、流服务路径统一经它计算。
+9. **设置项「默认下载目录」「默认并发下载数」保存后不生效（设置接线修复）**。`SessionManager` 构造只传了 cache_dir，两个设置项从未接入。修复：主窗口按配置传入 `download_dir`/`active_downloads`；流服务支持多根目录（`bases`），`download_dir` 配置在缓存目录之外时任务文件的预览/分块级可用性仍可服务（修改需重启生效，设置面板已注明）。
 
 已验证环境：Python 3.13.12 + libtorrent 2.1.1 + PySide6 6.11.2（Windows）。
 

@@ -13,7 +13,8 @@ PAGE_VIDEO, PAGE_GALLERY = 0, 1
 
 
 class PreviewPane(QWidget):
-    stop_requested = Signal()  # 用户点击「停止预览」
+    stop_requested = Signal()       # 用户点击「停止预览」
+    to_download_requested = Signal()  # 用户点击「转为下载」（当前种子转下载任务）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -25,6 +26,12 @@ class PreviewPane(QWidget):
 
         self.title = QLabel("（未选择文件）")
         self.title.setStyleSheet("padding:4px 2px; font-weight:500;")
+        self.btn_to_download = QPushButton("转为下载")
+        self.btn_to_download.setFixedWidth(88)
+        self.btn_to_download.setToolTip(
+            "把当前预览的种子转为下载任务：已下载分块直接复用，零额外下载")
+        self.btn_to_download.setEnabled(False)
+        self.btn_to_download.clicked.connect(self.to_download_requested.emit)
         self.btn_stop = QPushButton("停止预览")
         self.btn_stop.setFixedWidth(88)
         self.btn_stop.setEnabled(False)
@@ -32,6 +39,7 @@ class PreviewPane(QWidget):
 
         bar = QHBoxLayout()
         bar.addWidget(self.title, 1)
+        bar.addWidget(self.btn_to_download)
         bar.addWidget(self.btn_stop)
 
         layout = QVBoxLayout(self)
@@ -44,11 +52,13 @@ class PreviewPane(QWidget):
     def show_video(self, f: TorrentFile):
         self.title.setText(f"边下边播：{f.name}（{human_size(f.size)}）")
         self.btn_stop.setEnabled(True)
+        self.btn_to_download.setEnabled(True)
         self.stack.setCurrentIndex(PAGE_VIDEO)
 
     def show_gallery(self, f: TorrentFile | None = None):
         self.title.setText("图片画廊")
         self.btn_stop.setEnabled(True)
+        self.btn_to_download.setEnabled(True)
         if f is not None:
             self.gallery.show_file(f)
         self.stack.setCurrentIndex(PAGE_GALLERY)
@@ -58,3 +68,4 @@ class PreviewPane(QWidget):
         self.video.stop()
         self.title.setText("（未选择文件）")
         self.btn_stop.setEnabled(False)
+        self.btn_to_download.setEnabled(False)

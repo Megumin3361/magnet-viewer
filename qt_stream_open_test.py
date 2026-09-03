@@ -110,14 +110,14 @@ def main():
         from PySide6.QtMultimedia import QMediaPlayer as _m
         _m  # noqa
     except Exception as e:
-        print(f"! PySide6 QtMultimedia 不可用（{e}），跳过 Qt 开播验证")
-        return 0
+        print(f"[SKIP] PySide6 QtMultimedia 不可用（{e}），Qt 开播验证跳过")
+        return 2    # 退出码 2 = 显式跳过（区别于「通过=0 / 失败=1」假绿）
     tmp = tempfile.mkdtemp(prefix="mv_qtopen_")
     try:
         disk = os.path.join(tmp, "demo.mp4")
         if not make_tail_moov_mp4(disk):
-            print("! 无法用 ffmpeg 生成测试视频，跳过 Qt 开播验证")
-            return 0
+            print("[SKIP] 无法用 ffmpeg 生成测试视频，Qt 开播验证跳过")
+            return 2    # 退出码 2 = 显式跳过，避免「跳过=通过」假绿
         size = os.path.getsize(disk)
         print(f"[0] 真实尾部-moov MP4：{size / 1024 / 1024:.1f} MB")
 

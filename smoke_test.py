@@ -5,6 +5,7 @@
 4) 校验 core/ui 模块可完整导入。
 """
 import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -20,8 +21,8 @@ import libtorrent as lt  # noqa: E402
 from core.config import lt_proxy_settings  # noqa: E402
 from core.fetcher import SessionManager  # noqa: E402
 from core.models import (PieceMap, TorrentFile, contiguous_bytes,  # noqa: E402
-                         file_disk_path, human_size, range_available,
-                         safe_rel_path)
+                         disk_root, file_disk_path, human_size,
+                         range_available, safe_rel_path)
 from core.parser import bencode, parse_torrent_file, torrent_info_hash  # noqa: E402
 from core.stream_server import StreamServer, _is_within  # noqa: E402
 from core.scheduler import PreviewScheduler, tail_piece_window  # noqa: E402
@@ -156,6 +157,159 @@ def main():
             f"报错信息应说明原因，实际：{e}"
     print("[2c] 纯 v2 种子给出明确报错（而非 KeyError）")
 
+    # ---------------- [2d] taskstore / resume 纯函数持久化 ----------------
+    # 无网络、无 libtorrent 会话的确定性单测（补齐 README「纯函数测试缺失」）：
+    # .tasks.json 原子写/去重/损坏容错 + fastresume 路径约定/编解码。
+    from core.taskstore import (load_tasks, normalize_info_hash, remove_task,
+                                save_tasks, task_from_result, upsert_task,
+                                encode_file, decode_file)  # noqa: E402
+    from core.resume import (decode_resume, encode_resume, resume_dir,
+                             resume_path, write_resume)  # noqa: E402
+    from core.parser import bdecode as mv_bdecode  # noqa: E402
+
+    # 用 [2] 已解析的本地种子构造任务记录（source=torrent 的 result）
+    tdir = os.path.join(tmp, "taskstore")
+    t1 = task_from_result(r, state="downloading", save_path="downloads/demo",
+                          priority=1, retries=0, created_at=1000.0)
+    assert t1["info_hash"] == r.info_hash and len(t1["info_hash"]) == 40
+    assert len(t1["files"]) == len(r.files) and len(t1["selected"]) == len(r.view_files)
+    assert decode_file(encode_file(r.files[0])) == r.files[0]
+    assert decode_file({"index": "x"}) is None
+
+    # --- 去重：同 info_hash 后写覆盖前写、大小写不敏感 ---
+    tasks, replaced = upsert_task({}, t1)
+    assert not replaced and len(tasks) == 1 and tasks[r.info_hash]["retries"] == 0
+    t2 = dict(t1)
+    t2["state"], t2["retries"] = "paused", 2
+    tasks, replaced = upsert_task(tasks, t2)
+    assert replaced and len(tasks) == 1
+    assert tasks[r.info_hash]["state"] == "paused" and tasks[r.info_hash]["retries"] == 2
+    tasks, removed = remove_task(tasks, r.info_hash.upper())   # 大小写不敏感
+    assert removed and tasks == {}
+    tasks, removed = remove_task(tasks, r.info_hash)           # 已删除再删 → False
+    assert not removed
+    try:
+        upsert_task({}, {"name": "no-ih"})                     # 非法记录拒绝写入
+        raise AssertionError("非法任务记录应抛 ValueError")
+    except ValueError:
+        pass
+
+    # --- roundtrip：save -> load 完全一致（含中文名/特殊字符）---
+    fake = dict(t1)
+    fake["info_hash"] = "a" * 40
+    fake["name"] = "剧集 第一季/[字幕组] 第01集 #1&x+100%.mp4"
+    tasks, _ = upsert_task(tasks, t1)
+    tasks, _ = upsert_task(tasks, fake)
+    path_written = save_tasks(tdir, tasks)
+    assert path_written == os.path.join(tdir, ".tasks.json")
+    assert os.path.isfile(path_written) and not os.path.exists(path_written + ".tmp")
+    loaded = load_tasks(tdir)
+    assert loaded == tasks, f"save/load roundtrip 不一致：{loaded}"
+    assert loaded["a" * 40]["name"] == fake["name"]             # 中文名不丢字
+    print(f"[2d] taskstore roundtrip/去重通过：{len(tasks)} 任务（含中文名）原子落盘")
+
+    # --- 损坏容错：垃圾/截断/版本超前/结构错误 → 静默空表，绝不抛异常 ---
+    for junk in (b"\x00\xff\xfe not json at all",
+                 b'{"version": 1, "tasks": {"',                 # 截断
+                 "不是 JSON".encode("utf-8")):
+        with open(path_written, "wb") as f:
+            f.write(junk)
+        assert load_tasks(tdir) == {}, f"损坏文件应静默返回空表: {junk[:24]!r}"
+    with open(path_written, "w", encoding="utf-8") as f:        # 未来版本拒读
+        f.write(json.dumps({"version": 99, "tasks": {}}))
+    assert load_tasks(tdir) == {}
+    for bad in (["not", "a", "dict"], {"version": 1, "tasks": []}):
+        with open(path_written, "w", encoding="utf-8") as f:
+            f.write(json.dumps(bad, ensure_ascii=False))
+        assert load_tasks(tdir) == {}, f"结构错误应返回空表: {bad}"
+    assert load_tasks(os.path.join(tmp, "no_such_cache")) == {}  # 文件不存在
+    # 部分损坏：一条合法 + 一条非法（键即穿越/非法 ih）→ 只保留合法并告警
+    evil = dict(t1)
+    evil["info_hash"] = "../evil"                                # 路径穿越尝试
+    warns = []
+
+    def _disk_form(t):                                           # 内存态 → 磁盘形态
+        d = dict(t)
+        d["files"] = [encode_file(f) for f in t["files"]]
+        return d
+
+    with open(path_written, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"version": 1, "tasks": {
+            r.info_hash: _disk_form(t1), "../evil": _disk_form(evil)}},
+            ensure_ascii=False))
+    loaded = load_tasks(tdir, warn=warns.append)
+    assert loaded == {r.info_hash: t1}, f"合法记录应保留: {loaded}"
+    assert warns and any("非法" in w for w in warns)
+    print("[2d] taskstore 损坏容错通过：垃圾/截断/版本/结构/穿越键全部静默降级")
+
+    # --- 原子替换：replace 失败不破坏旧文件，成功后无 .tmp 残留 ---
+    save_tasks(tdir, tasks)
+    before = open(path_written, "rb").read()
+    assert before
+    real_replace, os.replace = os.replace, (lambda s, d: (_ for _ in ()).throw(
+        OSError("simulated replace failure")))
+    try:
+        try:
+            save_tasks(tdir, {})                                  # 写 tmp 成功、替换失败
+            raise AssertionError("save_tasks 应向上抛出 OSError")
+        except OSError:
+            pass
+    finally:
+        os.replace = real_replace
+    assert open(path_written, "rb").read() == before, \
+        "replace 失败不得破坏旧文件（原子性）"
+    save_tasks(tdir, tasks)                                       # 恢复后正常保存
+    assert load_tasks(tdir) == tasks
+    assert not os.path.exists(path_written + ".tmp"), "保存后不得残留 .tmp"
+    assert normalize_info_hash("A" * 40) == "a" * 40
+    assert normalize_info_hash(None) is None and normalize_info_hash("zz") is None
+    print("[2d] taskstore 原子替换通过：替换失败旧文件完好、成功后无残留")
+
+    # --- fastresume：路径约定 + 编解码 + 与 libtorrent 解码器互通 ---
+    ih = r.info_hash
+    rp = resume_path(tdir, ih)
+    assert rp == os.path.join(tdir, ".resume", f"{ih}.fastresume")
+    assert os.path.dirname(rp) == resume_dir(tdir)
+    assert resume_path(tdir, ih.upper()) == rp                   # 大小写归一
+    for bad_ih in ("..", "ag" * 20, "x" * 39, "x" * 41, "", "zz" * 20):
+        try:
+            resume_path(tdir, bad_ih)
+            raise AssertionError(f"非法 info_hash 应被拒绝: {bad_ih!r}")
+        except ValueError:
+            pass
+    resume = {b"file-format": b"libtorrent resume file",
+              b"file-version": 1,
+              b"info-hash": bytes.fromhex(ih),
+              b"pieces": bytes(range(256)),
+              b"total_uploaded": 12345,
+              b"num_seeds": 3,
+              b"mapped_files": [b"movie/demo.mp4", b"readme.txt"],
+              b"trackers": [[b"udp://tracker.example:1337/announce"]]}
+    raw = encode_resume(resume)
+    assert decode_resume(raw) == resume                          # roundtrip 恒等
+    assert mv_bdecode(raw) == resume                             # 自研解码互通
+    assert lt.bdecode(raw) == resume                             # libtorrent 互通
+    for junk in (b"", b"not bencode", raw[:-3], b"l1:ae"):        # 损坏 → None
+        assert decode_resume(junk) is None, f"损坏数据应返回 None: {junk[:20]!r}"
+    p = write_resume(tdir, ih, resume)                           # 原子写盘 + 读回
+    assert p == rp and os.path.isfile(rp) and not os.path.exists(rp + ".tmp")
+    assert decode_resume(open(rp, "rb").read()) == resume
+    print("[2d] fastresume 通过：路径约定/编解码 roundtrip/损坏容错/lt 互通")
+
+    # ---------------- [2e] disk_root：任务落盘根（P0-3 配套） ----------------
+    # save_subdir 相对时拼到 cache_dir；为绝对路径（download_dir 在缓存目录外）
+    # 时必须原样使用——os.path.join 会把 "D:/dl/ih" 退化成盘符相对路径 "D:dl/ih"。
+    _cache_abs = os.path.join(tmp, "cacheX")
+    assert disk_root(_cache_abs, "") == os.path.normpath(_cache_abs)
+    assert disk_root(_cache_abs, ".preview/ab12") == os.path.normpath(
+        os.path.join(_cache_abs, ".preview", "ab12"))
+    assert disk_root(_cache_abs, ".preview\\ab12") == os.path.normpath(
+        os.path.join(_cache_abs, ".preview", "ab12"))  # 反斜杠归一
+    abs_dl = os.path.join(tmp, "dl_outside", "ih")
+    assert disk_root(_cache_abs, abs_dl) == os.path.normpath(abs_dl), \
+        f"绝对路径必须原样使用，实际：{disk_root(_cache_abs, abs_dl)!r}"
+    print("[2e] disk_root 通过：空/相对/反斜杠/绝对路径四种形态")
+
     # ---------------- [2b] 路径穿越防护 ----------------
     # 恶意种子可声明 path: ["..","..","Windows","win.ini"] 或绝对路径，
     # 原样拼接会让预览 / 流服务逃出缓存目录。
@@ -201,6 +355,17 @@ def main():
     assert _is_within(os.path.normpath(cache0), os.path.normpath(escaped)), \
         f"file_disk_path 逃出缓存目录: {escaped}"
     print(f"[2b] 路径穿越防护通过：恶意路径 {f0.path!r} 被约束在缓存目录内")
+    # [2b1] bencode 防御：深层嵌套 / 超长整数 / 超长长度字段均被拒绝（防 DoS）
+    from core.parser import bdecode as _bdecode
+    for bad, why in ((b"l" * 100 + b"e" * 100, "深度炸弹"),
+                     (b"i" + b"9" * 200 + b"e", "超长整数"),
+                     (b"9" * 100 + b":x", "超长长度字段")):
+        try:
+            _bdecode(bad)
+            raise AssertionError(f"畸形 bencode 应被拒绝：{why}")
+        except ValueError:
+            pass
+    print("[2b1] bencode 防御通过：深度炸弹/超长整数/超长长度字段全部拒绝")
 
     # 流服务：直接请求穿越路径必须 404
     cache_t = os.path.join(tmp, "cacheT")
@@ -214,20 +379,37 @@ def main():
         f.write(b"SECRET")
     srv0 = StreamServer(cache_t)
     srv0.start()
-    base = srv0.url_for("in.mp4").rsplit("/", 1)[0]
+    good_url = srv0.url_for("in.mp4")          # 完整合法 URL（含鉴权 token）
+    scheme_host = good_url.rsplit("/in.mp4", 1)[0]   # http://127.0.0.1:P
+    token_query = good_url.split("?", 1)[1] if "?" in good_url else ""
     for attack in ("../../../evil.torrent",
                    "%2e%2e%2f%2e%2e%2f%2e%2e%2fWindows%2fwin.ini",
                    "/../cacheT_evil/secret.mp4",
                    f"/{os.path.basename(tmp)}/cacheT_evil/secret.mp4"):
+        url = f"{scheme_host}/{attack}" + (f"?{token_query}" if token_query else "")
         try:
-            urllib.request.urlopen(f"{base}/{attack}", timeout=5)
+            urllib.request.urlopen(url, timeout=5)
             raise AssertionError(f"穿越请求未被拒绝: {attack}")
         except urllib.error.HTTPError as e:
             assert e.code == 404, f"{attack} -> {e.code}，期望 404"
-    with urllib.request.urlopen(f"{base}/in.mp4", timeout=5) as resp:
+    with urllib.request.urlopen(good_url, timeout=5) as resp:
         assert resp.read() == b"x" * 4096, "合法路径应可正常读取"
+    # [2b2] 鉴权：无 token / 伪造 Host → 403（防 DNS rebinding 与同机进程直连）
+    try:
+        urllib.request.urlopen(scheme_host + "/in.mp4", timeout=5)
+        raise AssertionError("无 token 请求应被拒绝")
+    except urllib.error.HTTPError as e:
+        assert e.code == 403, e.code
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(good_url, headers={"Host": "evil.example"}),
+            timeout=5)
+        raise AssertionError("伪造 Host 应被拒绝")
+    except urllib.error.HTTPError as e:
+        assert e.code == 403, e.code
     srv0.shutdown()
     print("[2b] 流服务目录穿越（含 %2e 编码与同前缀兄弟目录）全部返回 404")
+    print("[2b2] 鉴权通过：无 token / 伪造 Host 均 403）")
 
     # 流服务 Range 测试
     cache = os.path.join(tmp, "cache")
@@ -395,8 +577,9 @@ def main():
 
     # 配置映射：应用代理配置 → libtorrent 设置键值（纯函数）
     from core.config import lt_proxy_settings
-    assert lt_proxy_settings(None) == {"proxy_type": 0,
-                                       "proxy_peer_connections": False}
+    direct = lt_proxy_settings(None)
+    assert direct == {"proxy_type": 0, "proxy_peer_connections": False,
+                      "proxy_tracker_connections": False}  # 直连同时重置 tracker
     m = lt_proxy_settings({"type": "socks5", "host": "127.0.0.1", "port": 1080,
                            "peer": True})
     assert m["proxy_type"] == 2 and m["proxy_hostname"] == "127.0.0.1"
@@ -406,7 +589,7 @@ def main():
                             "user": "u", "pass": "x"})
     assert mp["proxy_type"] == 5 and mp["proxy_username"] == "u"   # http + 账号 → http_pw
     assert lt_proxy_settings({"type": "socks5", "host": ""})["proxy_type"] == 0  # 空主机回落直连
-    print("[3g] 代理配置映射通过：直连/socks5/http_pw/空主机回落")
+    print("[3g] 代理配置映射通过：直连/socks5/http_pw/空主机回落（含 tracker 重置）")
 
     # 会话启动参数：代理 + 自定义元数据超时
     mgr = SessionManager(os.path.join(tmp, "px_cache"), listen_port=6893)
@@ -415,6 +598,32 @@ def main():
     mgr.shutdown()
     print("[3h] 会话启动参数通过：metadata_timeout=45 生效")
 
+    # [3h2] 流服务多根：download_dir 在缓存目录之外时任务文件仍可服务（P0-3 配套）
+    ext_root = os.path.join(tmp, "dl_outside")
+    os.makedirs(ext_root, exist_ok=True)
+    ext_payload = os.urandom(48 * 1024)
+    with open(os.path.join(ext_root, "movie.mp4"), "wb") as f:
+        f.write(ext_payload)
+    srv_ext = StreamServer(cache, bases=[ext_root])
+    srv_ext.start()
+    # url_for 携带绝对落盘路径（_stream_rel 在 save_subdir 为绝对路径时的形态）
+    url_ext = srv_ext.url_for(os.path.join(ext_root, "movie.mp4"))
+    with urllib.request.urlopen(url_ext, timeout=5) as resp:
+        body = resp.read()
+        assert resp.status == 200 and body == ext_payload, \
+            f"多根下的绝对路径应可服务：{resp.status} {len(body)}"
+    # 多根之外的绝对路径仍受穿越防护拒绝（base_dirs 不覆盖 → 404）
+    outside = os.path.join(tmp, "outside_secret.txt")
+    with open(outside, "w") as f:
+        f.write("SECRET")
+    try:
+        urllib.request.urlopen(srv_ext.url_for(outside), timeout=5)
+        raise AssertionError("多根之外的绝对路径应被拒绝")
+    except urllib.error.HTTPError as e:
+        assert e.code == 404, e.code
+    srv_ext.shutdown()
+    print("[3h2] 流服务多根通过：download_dir 外文件可服务、根外绝对路径仍 404")
+
     # 模块导入完整性
     from ui.file_tree import FileTreeWidget  # noqa: F401
     from ui.gallery import GalleryWidget  # noqa: F401
@@ -422,6 +631,8 @@ def main():
     from ui.preview_pane import PreviewPane  # noqa: F401
     from ui.preview_player import VideoPreviewWidget  # noqa: F401
     from ui.status_panel import StatusPanel  # noqa: F401
+    from ui.downloads_pane import DownloadsPane, format_eta  # noqa: F401
+    from ui.add_download_dialog import AddDownloadDialog  # noqa: F401
     from core.scheduler import PreviewScheduler  # noqa: F401
     print("[4] 全部模块导入通过")
 

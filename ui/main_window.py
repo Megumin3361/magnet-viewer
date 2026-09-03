@@ -1,25 +1,43 @@
-"""主窗口：输入解析 + 文件树 ⇄ 预览（视频/图片）双页签。"""
+"""主窗口：输入解析 + 文件树 ⇄ 预览（视频/图片）+ 下载管理三页签。"""
 from __future__ import annotations
 
 import os
 import tempfile
 
-from PySide6.QtCore import (QObject, QTimer, QStringListModel, Qt, Signal)
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
-from PySide6.QtWidgets import (QCompleter, QFileDialog, QHBoxLayout, QLabel,
-                               QLineEdit, QMainWindow, QMessageBox,
-                               QPushButton, QTabWidget, QVBoxLayout, QWidget)
+from PySide6.QtCore import (QObject, QTimer, QStringListModel, Qt, QUrl,
+                            Signal)
+from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
+from PySide6.QtWidgets import (QCompleter, QFileDialog, QHBoxLayout,
+                               QInputDialog, QLabel, QLineEdit, QMainWindow,
+                               QMessageBox, QPushButton, QTabWidget,
+                               QVBoxLayout, QWidget)
 
+from core.cache_guard import (clear_cache_contents, ensure_cache_dir,
+                              guard_ok_for_cleanup)
 from core.config import AppConfig
 from core.fetcher import SessionManager
-from core.models import ParseResult, PieceMap, TorrentFile, file_disk_path
+from core.logutil import log_warning
+from core.models import (ParseResult, PieceMap, TorrentFile, disk_root,
+                         file_disk_path)
 from core.stream_server import StreamServer
+from ui.add_download_dialog import AddDownloadDialog
+from ui.downloads_pane import DownloadsPane
 from ui.file_tree import FileTreeWidget
 from ui.preview_pane import PreviewPane
-from ui.settings_dialog import SettingsDialog, _rmtree_quiet
+from ui.settings_dialog import SettingsDialog
 from ui.status_panel import StatusPanel
 
-TAB_FILES, TAB_PREVIEW = 0, 1
+TAB_FILES, TAB_PREVIEW, TAB_DOWNLOADS = 0, 1, 2
+
+
+def _clear_preview_cache(cache_dir: str) -> int:
+    """只清预览缓存内容，保留 downloads/ 与任务持久化文件。
+
+    统一走 core.cache_guard.clear_cache_contents 的保留名单（决策 D8/D9）；
+    返回删除的条目数。注意：设置对话框「立即清理」曾在此之后再无名单清空
+    整个目录、误删用户下载数据（P0-1）——所有清理入口都必须经此函数。
+    """
+    return clear_cache_contents(cache_dir)
 
 
 class _Bridge(QObject):
@@ -35,12 +53,29 @@ class MainWindow(QMainWindow):
         self.resize(1040, 700)
 
         self.cfg = AppConfig()
-        self.cache_dir = str(self.cfg.get("cache_dir") or
-                             os.path.join(tempfile.gettempdir(),
-                                          "magnet_viewer_cache"))
+        configured = str(self.cfg.get("cache_dir") or "")
+        self.cache_dir = (configured or
+                          os.path.join(tempfile.gettempdir(),
+                                       "magnet_viewer_cache"))
+        try:
+            ensure_cache_dir(self.cache_dir)
+        except ValueError as e:
+            # 配置了高风险目录（盘符根/用户数据目录）：回退默认并写回设置
+            log_warning("main.cache_dir", f"{e}，回退默认缓存目录")
+            self.cache_dir = os.path.join(tempfile.gettempdir(),
+                                          "magnet_viewer_cache")
+            ensure_cache_dir(self.cache_dir)
+            self.cfg.set("cache_dir", "")
 
         # ---- core ----
-        self.session = SessionManager(self.cache_dir)
+        # 设置面板的「默认下载目录」「默认并发下载数」必须在此接入：
+        # 此前 SessionManager 只收 cache_dir，两个设置项保存后完全不生效（P0-3）。
+        # download_dir 空串回落 None（默认 cache_dir/downloads）；download_dir
+        # 与并发数在会话启动时固定，修改后需重启程序生效（提示见设置面板）。
+        self.session = SessionManager(
+            self.cache_dir,
+            download_dir=str(self.cfg.get("download_dir") or "").strip() or None,
+            active_downloads=int(self.cfg.get("default_concurrency") or 3))
         self.session.start(proxy=self.cfg.proxy(),
                            metadata_timeout=self.cfg.get("metadata_timeout"))
         self.bridge = _Bridge()
@@ -48,8 +83,12 @@ class MainWindow(QMainWindow):
         self.session.on_error = self.bridge.resolve_failed.emit
 
         self._path_to_file: dict[str, TorrentFile] = {}  # 磁盘路径 -> 文件
-        self.server = StreamServer(self.cache_dir, pieces_cb=self._pieces_map,
-                                   demand_cb=self._demand_range)
+        # 流服务多根：download_dir 配置在缓存目录之外时，下载任务文件的
+        # 分块级可用性判定/按需补拉仍须可服务（url_for 携带绝对落盘路径）。
+        self.server = StreamServer(
+            self.cache_dir, pieces_cb=self._pieces_map,
+            demand_cb=self._demand_range,
+            bases=[self.session.download_dir])
         self.server.start()
 
         self.result: ParseResult | None = None
@@ -57,6 +96,7 @@ class MainWindow(QMainWindow):
         self._pending_video: tuple[TorrentFile, str] | None = None  # 等待首批数据
         self._stream_url: str | None = None   # 当前视频流地址（失败重试用）
         self._stream_attempts = 0
+        self._last_source: str = ""           # 最近一次解析来源（转下载用）
 
         # ---- UI ----
         self._build_ui()
@@ -65,10 +105,23 @@ class MainWindow(QMainWindow):
         self.bridge.metadata_ready.connect(self._on_metadata)
         self.bridge.resolve_failed.connect(self._on_error)
         self.tree.file_activated.connect(self._open_preview)
+        self.tree.add_download_requested.connect(
+            lambda f: self._confirm_add_task(self._last_source))
         self.preview.stop_requested.connect(self._stop_preview)
+        self.preview.to_download_requested.connect(self._preview_to_download)
         self.preview.video.seek_requested.connect(self._on_seek)
         self.preview.video.stream_failed.connect(self._on_stream_failed)
         self.preview.gallery.file_requested.connect(self._on_gallery_file)
+        # 下载页信号接线
+        self.downloads.pause_requested.connect(self._task_pause)
+        self.downloads.resume_requested.connect(self._task_resume)
+        self.downloads.remove_requested.connect(self._task_remove)
+        self.downloads.priority_up_requested.connect(
+            lambda t: self._task_priority(t, +1))
+        self.downloads.priority_down_requested.connect(
+            lambda t: self._task_priority(t, -1))
+        self.downloads.opendir_requested.connect(self._task_open_dir)
+        self.downloads.openpreview_requested.connect(self._task_open_preview)
 
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(700)
@@ -122,15 +175,24 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.input, 1)
         bar.addWidget(self.btn_open)
         bar.addWidget(self.btn_resolve)
+        self.btn_add_download = QPushButton("添加下载")
+        self.btn_add_download.setToolTip(
+            "把磁力链 / .torrent 添加为下载任务（可输入框粘贴后直接使用）")
+        self.btn_add_download.clicked.connect(self._add_download_flow)
+        bar.addWidget(self.btn_add_download)
         self.btn_settings = QPushButton("设置")
         self.btn_settings.setFixedWidth(56)
         self.btn_settings.clicked.connect(self._open_settings)
         bar.addWidget(self.btn_settings)
         root.addLayout(bar)
 
-        self.hint = QLabel(
-            "解析只获取文件清单（不下载资源本体）；双击视频/图片文件即可在「预览」页边下边播或浏览。"
-            f"磁力链元数据获取超时 {int(self.session.metadata_timeout)} 秒。")
+        self.hint = QLabel()
+        # 模板保存原始指引文案：保存设置时只替换超时数字，不截断其他部分
+        self._hint_template = ("解析只获取文件清单（不下载资源本体）；"
+                               "双击视频/图片文件即可在「预览」页边下边播或浏览。"
+                               "磁力链元数据获取超时 {} 秒。")
+        self.hint.setText(
+            self._hint_template.format(int(self.session.metadata_timeout)))
         self.hint.setStyleSheet("color:#777; font-size:12px;")
         root.addWidget(self.hint)
 
@@ -138,8 +200,10 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tree = FileTreeWidget()
         self.preview = PreviewPane()
+        self.downloads = DownloadsPane()
         self.tabs.addTab(self.tree, "文件列表")
         self.tabs.addTab(self.preview, "预览")
+        self.tabs.addTab(self.downloads, "下载")
         self.tabs.setTabEnabled(TAB_PREVIEW, False)
         root.addWidget(self.tabs, 1)
 
@@ -155,15 +219,27 @@ class MainWindow(QMainWindow):
             # 代理与超时立即生效（缓存目录重启生效）
             self.session.apply_proxy(self.cfg.proxy())
             self.session._metadata_timeout = float(self.cfg.get("metadata_timeout"))
-            self.hint.setText(self.hint.text().split("。")[0] + "。"
-                              f"磁力链元数据获取超时 {int(self.session.metadata_timeout)} 秒。")
+            self.hint.setText(
+                self._hint_template.format(int(self.session.metadata_timeout)))
             self.status_panel.set_state("设置已保存")
 
     def _clear_cache_now(self):
-        """设置对话框「立即清理缓存」：先停预览再清空目录内容。"""
+        """设置对话框「立即清理缓存」：先停预览，再只清预览缓存内容。
+
+        决策 D8：downloads/（用户下载数据）与任务持久化文件（.tasks.json /
+        .resume）不在清理范围；守卫校验不变（受管标记）。
+        """
         self._stop_preview()
-        _rmtree_quiet(self.cache_dir)
-        os.makedirs(self.cache_dir, exist_ok=True)
+        if not guard_ok_for_cleanup(self.cache_dir):
+            log_warning("main.clear_cache_now",
+                        f"拒绝清理非受管缓存目录：{self.cache_dir}")
+            return -1
+        try:
+            cleanup = _clear_preview_cache(self.cache_dir)
+        except Exception as e:
+            log_warning("main.clear_cache_now", f"清理失败：{e}")
+            return -1
+        return cleanup
 
     # ---------- 动作 ----------
 
@@ -187,6 +263,7 @@ class MainWindow(QMainWindow):
         self._pending_video = None
         self._stream_url = None
         self._stream_attempts = 0
+        self._last_source = source
         self.tabs.setTabEnabled(TAB_PREVIEW, False)
         self._recent_model.setStringList(self.cfg.push_recent(source))
         try:
@@ -194,11 +271,162 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._on_error(str(e))
 
+    # ---------- 下载任务：添加与操作 ----------
+
+    def _add_download_flow(self):
+        """顶栏「添加下载」：优先取输入框内容，否则弹输入框要来源。"""
+        text = self.input.text().strip()
+        if not (text.lower().startswith("magnet:")
+                or (os.path.isfile(text) and text.lower().endswith(".torrent"))):
+            text, ok = QInputDialog.getText(
+                self, "添加下载",
+                "磁力链接或 .torrent 文件路径：", text=text)
+            if not ok:
+                return
+        source = text.strip()
+        if source:
+            self._confirm_add_task(source)
+
+    def _confirm_add_task(self, source: str):
+        """添加下载确认：子目录 / 优先级 / 完成后做种 → 调 add_task。"""
+        source = (source or "").strip()
+        if not source:
+            self.status_panel.set_state("添加下载失败：来源为空")
+            return
+        dlg = AddDownloadDialog(self.cfg, "（任务创建后自动获取名称）", 0,
+                                default_save_dir="", parent=self)
+        if dlg.exec() != AddDownloadDialog.DialogCode.Accepted:
+            return
+        save_subdir = dlg.save_path() or None
+        try:
+            tid = self.session.add_task(source, save_subdir=save_subdir,
+                                        priority=dlg.priority(),
+                                        seed=dlg.seed_after_complete())
+        except Exception as e:
+            log_warning("main.add_task", str(e))
+            QMessageBox.warning(self, "添加下载失败", str(e))
+            return
+        self.tabs.setCurrentIndex(TAB_DOWNLOADS)
+        # add_task 对重复 info_hash 返回已存在任务 id（自动去重），
+        # 新任务与已存在任务统一按此提示
+        self.status_panel.set_state(
+            f"已提交下载任务：{str(tid)[:16]}…（重复 info_hash 自动去重不重复下载）")
+
+    def _task_id(self, task: dict) -> str:
+        tid = task.get("id") or task.get("info_hash") or ""
+        return str(tid)
+
+    def _task_pause(self, task: dict):
+        tid = self._task_id(task)
+        if tid and self.session.pause_task(tid):
+            self.status_panel.set_state(f"已暂停任务：{task.get('name') or tid[:16]}")
+        else:
+            self.status_panel.set_state("暂停失败：任务不存在或状态不可暂停")
+
+    def _task_resume(self, task: dict):
+        tid = self._task_id(task)
+        if tid and self.session.resume_task(tid):
+            self.status_panel.set_state(f"已恢复任务：{task.get('name') or tid[:16]}")
+        else:
+            self.status_panel.set_state("恢复失败：任务不存在或状态不可恢复")
+
+    def _task_remove(self, task: dict):
+        tid = self._task_id(task)
+        if not tid:
+            return
+        name = task.get("name") or tid[:16]
+        box = QMessageBox(self)
+        box.setWindowTitle("删除任务")
+        box.setText(f"删除任务「{name}」？\n\n请选择清理方式：")
+        btn_keep = box.addButton("仅删除任务（保留文件）", QMessageBox.AcceptRole)
+        btn_del = box.addButton("删除任务和文件", QMessageBox.DestructiveRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is btn_keep or clicked is btn_del:
+            ok = self.session.remove_task(tid, delete_files=(clicked is btn_del))
+            self.status_panel.set_state(
+                f"已删除任务：{name}" if ok else f"删除任务失败：{name}")
+
+    def _task_priority(self, task: dict, delta: int):
+        if not hasattr(self.session, "set_priority"):
+            self.status_panel.set_state("优先级调整暂未开放（后续版本接入）")
+            return
+        cur = int(task.get("priority", 1) or 1)
+        try:
+            self.session.set_priority(self._task_id(task),
+                                      max(0, min(3, cur + delta)))
+            self.status_panel.set_state("已调整任务优先级")
+        except Exception as e:
+            log_warning("main.priority", str(e))
+            self.status_panel.set_state("调整优先级失败")
+
+    def _task_open_dir(self, task: dict):
+        path = task.get("save_path") or ""
+        if not path or not os.path.isdir(path):
+            path = os.path.join(self.cache_dir, "downloads")
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _task_open_preview(self, task: dict):
+        """下载页「打开预览」：聚焦任务 → 载入其文件树 → 定位可预览文件。
+
+        任务文件在 downloads/<ih>/（或自定义子目录）落盘，已下载分块
+        可边下边播（分块级流服务 + 按需补拉 + moov 尾部窗口）。
+        """
+        tid = self._task_id(task)
+        if tid:
+            try:
+                self.session.focus_task(tid)
+            except Exception as e:
+                log_warning("main.focus_task", f"{e}")
+        res = self.session.task_result(tid)
+        if res is None:
+            self.status_panel.set_state(
+                f"任务「{task.get('name') or tid[:16]}」元数据未就绪"
+                f"或无法载入文件列表")
+            self.tabs.setCurrentIndex(TAB_DOWNLOADS)
+            return
+        # 与 _on_metadata 相同的映射/文件树载入（任务落盘目录带子目录前缀；
+        # save_subdir 为绝对路径时直接使用——download_dir 可在缓存目录之外）
+        self.result = res
+        save_dir = disk_root(res.cache_dir or self.cache_dir,
+                             getattr(res, "save_subdir", ""))
+        self._path_to_file = {
+            os.path.normpath(file_disk_path(save_dir, f)): f
+            for f in res.files
+        }
+        self.tree.populate(res)
+        self.preview.gallery.set_result(res)
+        self.tabs.setTabEnabled(TAB_PREVIEW, True)
+        self.tabs.setCurrentIndex(TAB_FILES)
+        vf = next((f for f in res.view_files if f.is_previewable), None)
+        if vf is not None:
+            self.tree.select_file(vf)
+            self.status_panel.set_state(
+                f"任务「{res.name}」已载入文件列表，选中 {vf.name}"
+                f"（可预览已下载分块）")
+        else:
+            self.status_panel.set_state(
+                f"任务「{res.name}」已载入文件列表（无可预览媒体文件）")
+
+    def _preview_to_download(self):
+        """预览页「转为下载」：当前预览种子直接转正为下载任务（零额外下载）。"""
+        if not self._last_source:
+            self.status_panel.set_state("请先解析磁力链或种子，再转为下载")
+            return
+        self._confirm_add_task(self._last_source)
+
     def _on_metadata(self, result: ParseResult):
         self.result = result
-        # 以主窗口的 cache_dir 为准（不依赖解析侧注入，双重保险）
+        # 以主窗口的 cache_dir 为准（不依赖解析侧注入，双重保险）；
+        # 落盘目录含任务隔离子目录（.preview/<ih> 或 downloads/<ih>，见
+        # ParseResult.save_subdir），映射键必须拼在该子目录下才能命中
+        # StreamServer 实际回调的磁盘路径。save_subdir 为绝对路径时
+        # disk_root 直接采用（download_dir 可在缓存目录之外）。
+        save_dir = disk_root(result.cache_dir or self.cache_dir,
+                             getattr(result, "save_subdir", ""))
         self._path_to_file = {
-            os.path.normpath(file_disk_path(self.cache_dir, f)): f
+            os.path.normpath(file_disk_path(save_dir, f)): f
             for f in result.files
         }
         self.tree.populate(result)
@@ -229,12 +457,29 @@ class MainWindow(QMainWindow):
             self.preview.show_video(f)
             # 不立即播放：等头部连续数据 + 尾部索引块（moov，MP4/MOV）都就绪后
             # 再 set_stream，避免播放器读到稀疏零数据或探测不到 moov
-            self._stream_url = self.server.url_for(f.path)
+            self._stream_url = self.server.url_for(self._stream_rel(f))
             self._pending_video = (f, self._stream_url)
             self.preview.video.set_waiting(f.name, f.size)
         else:
             self.preview.show_gallery(f)
         self.tabs.setCurrentIndex(TAB_PREVIEW)
+
+    def _stream_rel(self, f: TorrentFile) -> str:
+        """文件在缓存根目录下的服务相对路径（含任务隔离子目录，D7）。
+
+        数据按 save_subdir（.preview/<ih> 或 downloads/<ih>）落盘，流服务
+        base_dir 是 cache_dir，url_for 必须带上该前缀才能命中真实文件；
+        save_subdir 为绝对路径（download_dir 在缓存目录之外）时返回绝对
+        落盘路径，由流服务 base_dirs（含 download_dir）越根放行。
+        """
+        sub = getattr(self.result, "save_subdir", "") if self.result else ""
+        if not sub:
+            return f.path
+        root = disk_root(self.result.cache_dir or self.cache_dir, sub)
+        if os.path.isabs(root):
+            return os.path.join(root, *f.path.split("/"))
+        prefix = [s for s in sub.replace("\\", "/").split("/") if s]
+        return "/".join(prefix + [f.path])
 
     def _stop_preview(self):
         """用户点击「停止预览」：停下载、停播放、复位界面。"""
@@ -264,8 +509,14 @@ class MainWindow(QMainWindow):
     def _pieces_map(self, disk_path: str):
         """流服务回调：返回该文件的分块映射（按已下载分块判定可读区间）。
 
-        非预览文件（图片/已完成的文件）返回 None → 按完整静态文件服务。
+        优先级：①下载任务文件（按磁盘路径反查任务句柄，分块级可用）；
+        ②已解析预览/画廊文件（_path_to_file 映射）。两者都查不到 → None
+        （流服务按静态整文件服务，仅用于已完成的受管文件；下载中任务
+        必定命中①，绝不会被当作整文件喂零数据）。
         """
+        pm = self.session.piece_map_for_path(disk_path)
+        if pm is not None:
+            return pm
         f = self._path_to_file.get(os.path.normpath(disk_path))
         if f is None:
             return None
@@ -277,7 +528,12 @@ class MainWindow(QMainWindow):
                         size=f.size, have=self.session.have_piece)
 
     def _demand_range(self, disk_path: str, start: int, end_excl: int):
-        """流服务回调：播放器要读的字节尚未下载 → 立刻改下载这段。"""
+        """流服务回调：播放器要读的字节尚未下载 → 立刻改下载这段。
+
+        下载任务文件先按路径触发任务级补拉；其次预览文件走调度器。
+        """
+        if self.session.demand_for_path(disk_path, start, end_excl):
+            return
         f = self._path_to_file.get(os.path.normpath(disk_path))
         if f is None or f is not self._preview_file:
             return
@@ -290,6 +546,11 @@ class MainWindow(QMainWindow):
         if self._preview_file is not None and st is not None:
             self.preview.video.update_buffer(st.get("buffer", 0.0),
                                              st.get("download_rate", 0))
+        # 下载任务列表（700ms 轮询注入；tasks() 自带派生进度/速度/ETA）
+        try:
+            self.downloads.set_tasks(self.session.tasks())
+        except Exception as e:
+            log_warning("main.refresh_tasks", f"{e}")
         # 视频开播条件：头部连续数据 + 尾部索引块（moov）都已就绪
         if self._pending_video is not None and st is not None:
             f, url = self._pending_video
@@ -307,6 +568,7 @@ class MainWindow(QMainWindow):
         if self._stream_url is None:
             return
         if self._stream_attempts >= 4:
+            self.preview.video.show_error("播放器多次打开失败：数据仍未就绪，继续下载中…")
             self.status_panel.set_state("播放器多次打开失败：数据仍未就绪，继续下载中…")
             return
         self._stream_attempts += 1
@@ -316,6 +578,8 @@ class MainWindow(QMainWindow):
     def _retry_stream(self):
         if self._preview_file is None or self._stream_url is None:
             return
+        if self._pending_video is not None:
+            return  # 用户已重新选文件/重新开播：放弃旧重试（竞态守卫）
         st = self.session.status()
         if st is None:
             QTimer.singleShot(1500, self._retry_stream)
@@ -327,6 +591,7 @@ class MainWindow(QMainWindow):
         self.preview.video.set_stream(self._stream_url,
                                       self._preview_file.name,
                                       self._preview_file.size)
+        self._stream_attempts = 0   # 开播成功：重试计数归零，下次失败可重新重试
 
     # ---------- 关闭 ----------
 
@@ -335,6 +600,13 @@ class MainWindow(QMainWindow):
             self.session.shutdown()
             self.server.shutdown()
             if self.cfg.get("clear_cache_on_exit"):
-                _rmtree_quiet(self.cache_dir)
+                # 决策 D8：退出清理只清预览缓存，downloads/（用户下载数据）
+                # 与任务持久化文件（.tasks.json/.resume）保留；
+                # 根目录仍须通过受管标记守卫（拒绝清非受管目录）
+                if not guard_ok_for_cleanup(self.cache_dir):
+                    log_warning("main.close.clear_cache",
+                                f"拒绝清理非受管缓存目录：{self.cache_dir}")
+                else:
+                    _clear_preview_cache(self.cache_dir)
         finally:
             super().closeEvent(event)

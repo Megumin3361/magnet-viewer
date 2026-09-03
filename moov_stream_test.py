@@ -139,14 +139,16 @@ def run_case(tmp: str, name: str, have: set[int],
 
 def main():
     if find_probe_tool() is None:
-        print("! 未找到 ffprobe/ffmpeg，跳过探测验证（HTTP 行为仍由 smoke_test 覆盖）")
-        return 0
+        print("[SKIP] 未找到 ffprobe/ffmpeg（含 imageio-ffmpeg），"
+              "探测验证跳过（HTTP 行为仍由 smoke_test 覆盖）")
+        return 2    # 退出码 2 = 显式跳过（区别于「通过=0 / 失败=1」假绿）
     tmp = tempfile.mkdtemp(prefix="mv_moov_")
     try:
         disk = os.path.join(tmp, "demo.mp4")
         if not make_tail_moov_mp4(disk):
-            print("! 无法用 ffmpeg 生成测试视频，跳过（HTTP 行为仍由 smoke_test 覆盖）")
-            return 0
+            print("[SKIP] 无法用 ffmpeg 生成测试视频，探测验证跳过"
+                  "（HTTP 行为仍由 smoke_test 覆盖）")
+            return 2    # 退出码 2 = 显式跳过，避免「跳过=通过」假绿
         size = os.path.getsize(disk)
         with open(disk, "rb") as f:
             raw = f.read()

@@ -96,7 +96,11 @@ def run_case(label: str, tmp: str, source: str, info_hash: str,
 
     # 关键：构造的 path 必须与 libtorrent 真实落盘位置一致
     expect_rel = os.path.basename(seed_src)  # 占位
-    disk = file_disk_path(mgr.cache_dir, vid)
+    # 目录隔离（决策 D7）：预览落盘 cache_dir/.preview/<ih>/
+    # （r.save_subdir 由 SessionManager 注入；接口未变，仅断言路径随布局更新）
+    save_dir = os.path.join(mgr.cache_dir, *r.save_subdir.split("/")) \
+        if getattr(r, "save_subdir", "") else mgr.cache_dir
+    disk = file_disk_path(save_dir, vid)
     check(len(vid.path.split("/")) == 1,
           f"单文件 path 不含多余目录层：{vid.path!r}")
 
@@ -123,7 +127,10 @@ def run_case(label: str, tmp: str, source: str, info_hash: str,
     srv = StreamServer(mgr.cache_dir)
     srv.start()
     try:
-        req = urllib.request.Request(srv.url_for(vid.path),
+        # 目录隔离（D7）：服务相对路径要带上 save_subdir 前缀才能命中真实文件
+        rel = "/".join([s for s in r.save_subdir.split("/") if s] + [vid.path]) \
+            if getattr(r, "save_subdir", "") else vid.path
+        req = urllib.request.Request(srv.url_for(rel),
                                      headers={"Range": "bytes=0-1023"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             body = resp.read()
@@ -131,7 +138,7 @@ def run_case(label: str, tmp: str, source: str, info_hash: str,
         check(status == 206 and len(body) == 1024,
               f"流服务可按 f.path 供给（status={status}, {len(body)}B）")
     except urllib.error.HTTPError as e:
-        check(False, f"流服务请求失败：HTTP {e.code}（url={srv.url_for(vid.path)}）")
+        check(False, f"流服务请求失败：HTTP {e.code}（url={srv.url_for(rel)}）")
     finally:
         srv.shutdown()
 

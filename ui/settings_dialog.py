@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import os
-import shutil
 
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QHBoxLayout, QLabel,
                                QLineEdit, QMessageBox, QPushButton, QSpinBox,
                                QVBoxLayout)
 
+from core.cache_guard import (CACHE_MARKER, clear_cache_contents,
+                              ensure_cache_dir, guard_ok_for_cleanup)
 from core.config import AppConfig
 
 PROXY_LABELS = [("none", "不使用代理（直连）"),
@@ -74,8 +75,27 @@ class SettingsDialog(QDialog):
         self.clear_on_exit.setChecked(bool(cfg.get("clear_cache_on_exit")))
         form.addRow("", self.clear_on_exit)
 
-        note = QLabel("提示：代理与超时保存后立即生效；缓存目录修改需重启程序。"
-                      "配置文件中请勿包含空格或非 ASCII 字符。")
+        self.concurrency = QSpinBox()
+        self.concurrency.setRange(1, 16)
+        self.concurrency.setValue(int(cfg.get("default_concurrency")))
+        form.addRow("默认并发下载数", self.concurrency)
+
+        row_dl = QHBoxLayout()
+        self.download_edit = QLineEdit(str(cfg.get("download_dir")))
+        self.download_edit.setPlaceholderText("留空 = 缓存目录/downloads")
+        btn_dl = QPushButton("浏览…")
+        btn_dl.clicked.connect(self._pick_download_dir)
+        row_dl.addWidget(self.download_edit, 1)
+        row_dl.addWidget(btn_dl)
+        form.addRow("默认下载目录", row_dl)
+
+        self.seed_after = QCheckBox("任务完成后继续做种")
+        self.seed_after.setChecked(bool(cfg.get("seed_after_complete")))
+        form.addRow("", self.seed_after)
+
+        note = QLabel("提示：代理与超时保存后立即生效；缓存目录、默认下载目录"
+                      "与并发数修改需重启程序。设置持久化于本机"
+                      "（Windows 注册表 Bitseed\\MagnetViewer）。")
         note.setStyleSheet("color:#777; font-size:12px;")
         note.setWordWrap(True)
 
@@ -102,15 +122,52 @@ class SettingsDialog(QDialog):
         if d:
             self.cache_edit.setText(d)
 
+    def _pick_download_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择默认下载目录")
+        if d:
+            self.download_edit.setText(d)
+
     def _clear_cache(self):
+        """「立即清理缓存」：所见即所得——清理编辑框当前值（含未保存的改动）。
+
+        守卫：非受管缓存目录（无标记文件/高风险目录）拒绝清理并明确提示。
+        内容删除统一走 `clear_cache_contents()` 的保留名单——downloads/
+        （用户下载数据）、.tasks.json（任务清单）、.resume/（续传数据）
+        绝不参与清理（历史缺陷：此处曾再以 `_rmtree_quiet` 无名单清空
+        整个目录，误删用户下载数据，P0-1）。
+        """
+        target = (self.cache_edit.text().strip() or self.cache_dir)
+        if not guard_ok_for_cleanup(target):
+            QMessageBox.warning(
+                self, "拒绝清理",
+                f"「{target}」不是受管的缓存目录（缺少标记文件 {CACHE_MARKER}，"
+                f"或属于磁盘根/用户数据目录），已取消清理，防止误删。")
+            return
         if self._on_clear_cache is not None:
-            self._on_clear_cache()
-        removed = _rmtree_quiet(self.cache_dir)
-        os.makedirs(self.cache_dir, exist_ok=True)
+            self._on_clear_cache()   # 停预览等准备工作（针对当前会话目录）
+        removed = clear_cache_contents(target)
+        os.makedirs(target, exist_ok=True)
         QMessageBox.information(self, "清理完成",
                                 f"缓存已清理{'（' + str(removed) + ' 项）' if removed else ''}")
 
     def _save(self):
+        # 代理配置校验：选了代理类型但主机为空 → 会静默回落直连（隐私勾选失效）
+        if (self.proxy_type.currentData() in ("socks5", "http")
+                and not self.proxy_host.text().strip()):
+            QMessageBox.warning(
+                self, "代理配置不完整",
+                "已选择代理类型但未填写代理主机。保存后实际会绕过代理直连，"
+                "「Peer 连接走代理」将形同虚设。请填写主机（例如 127.0.0.1），"
+                "或把代理类型改为「不使用代理」。")
+            return
+        # 缓存目录保存前做守卫校验：盘符根/用户数据目录直接拒绝保存
+        cache_path = self.cache_edit.text().strip()
+        try:
+            if cache_path:
+                ensure_cache_dir(cache_path)
+        except ValueError as e:
+            QMessageBox.warning(self, "缓存目录无效", str(e))
+            return
         self.cfg.set("proxy_type", self.proxy_type.currentData())
         self.cfg.set("proxy_host", self.proxy_host.text().strip())
         self.cfg.set("proxy_port", self.proxy_port.value())
@@ -118,25 +175,9 @@ class SettingsDialog(QDialog):
         self.cfg.set("proxy_pass", self.proxy_pass.text())
         self.cfg.set("proxy_peer", self.proxy_peer.isChecked())
         self.cfg.set("metadata_timeout", self.timeout.value())
-        self.cfg.set("cache_dir", self.cache_edit.text().strip())
+        self.cfg.set("cache_dir", cache_path)
         self.cfg.set("clear_cache_on_exit", self.clear_on_exit.isChecked())
+        self.cfg.set("default_concurrency", self.concurrency.value())
+        self.cfg.set("download_dir", self.download_edit.text().strip())
+        self.cfg.set("seed_after_complete", self.seed_after.isChecked())
         self.accept()
-
-
-def _rmtree_quiet(path: str) -> int:
-    """静默清空目录内容，返回删除条数（失败忽略）。"""
-    removed = 0
-    try:
-        for name in os.listdir(path):
-            full = os.path.join(path, name)
-            try:
-                if os.path.isdir(full):
-                    shutil.rmtree(full, ignore_errors=True)
-                else:
-                    os.remove(full)
-                removed += 1
-            except OSError:
-                pass
-    except OSError:
-        pass
-    return removed

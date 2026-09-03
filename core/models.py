@@ -71,6 +71,11 @@ class ParseResult:
     created_by: str = ""
     source: str = ""              # "torrent" | "magnet"
     cache_dir: str = ""           # 磁盘缓存根目录（由会话管理器注入）
+    save_subdir: str = ""         # 落盘子目录（D7 隔离：".preview/<ih>" 或
+                                  # "downloads/<ih>"；空 = 平铺 cache_dir）。
+                                  # 语义：相对 cache_dir 的子目录；download_dir
+                                  # 配置在 cache_dir 之外时为绝对路径。由会话
+                                  # 管理器注入，main_window 据此拼磁盘路径键。
 
     @property
     def view_files(self) -> list:
@@ -110,8 +115,30 @@ def safe_rel_path(*segments: str) -> str:
     return "/".join(out) or "unnamed"
 
 
+def disk_root(cache_dir: str, save_subdir: str = "") -> str:
+    """任务落盘根目录：``save_subdir`` 相对时拼到 cache_dir，绝对路径时直接使用。
+
+    ``ParseResult.save_subdir`` 语义：相对 cache_dir 的子目录（如 ``.preview/<ih>``、
+    ``downloads/<ih>``）；当 download_dir 配置在 cache_dir 之外时为**绝对路径**
+    （见 fetcher._save_subdir_of）。用 ``os.path.join`` 把绝对路径拼到别的目录下
+    会退化成盘符相对路径（``C:\\cache`` + ``D:\\dl\\ih`` → ``D:dl\\ih``），
+    必须在此统一处理——main_window 的磁盘键、画廊、流服务相对路径都经此函数。
+    """
+    sub = str(save_subdir or "").strip()
+    if not sub:
+        return str(cache_dir or "")
+    if os.path.isabs(sub):
+        return sub
+    return os.path.join(str(cache_dir or ""),
+                        *[s for s in sub.replace("\\", "/").split("/") if s])
+
+
 def file_disk_path(cache_dir: str, f: TorrentFile) -> str:
-    """文件在磁盘缓存中的完整路径（经 safe_rel_path 净化，不会逃出 cache_dir）。"""
+    """文件在磁盘缓存中的完整路径（经 safe_rel_path 净化，不会逃出 cache_dir）。
+
+    注意：带任务隔离布局时请用 ``file_disk_path(disk_root(cache_dir, save_subdir), f)``
+    （gallery 曾因漏拼 save_subdir 而永远找不到已下载图片）。
+    """
     return os.path.join(cache_dir, *safe_rel_path(f.path).split("/"))
 
 

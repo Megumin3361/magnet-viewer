@@ -12,6 +12,7 @@ import math
 
 import libtorrent as lt
 
+from .logutil import log_warning
 from .models import PieceMap, contiguous_bytes
 
 LOOKAHEAD_PIECES = 60        # 一次向前预约的分块数量
@@ -68,8 +69,8 @@ class PreviewScheduler:
         for p in self._tail_pieces:
             try:
                 self.handle.set_piece_deadline(p, 0)
-            except Exception:
-                pass
+            except Exception as e:
+                log_warning("scheduler.request_tail", f"piece={p}: {e}")
 
     def tail_ready(self) -> bool:
         """尾部索引窗口是否已全部落盘（无窗口时恒为 True）。"""
@@ -77,7 +78,8 @@ class PreviewScheduler:
             return True
         try:
             return all(self.handle.have_piece(p) for p in self._tail_pieces)
-        except Exception:
+        except Exception as e:
+            log_warning("scheduler.tail_ready", f"{e}")
             return False
 
     def contiguous_progress(self) -> int:
@@ -92,7 +94,8 @@ class PreviewScheduler:
                           self.file.start_piece, self.file.end_piece,
                           self.file.size, self.handle.have_piece)
             return contiguous_bytes(pm)
-        except Exception:
+        except Exception as e:
+            log_warning("scheduler.contiguous_progress", f"{e}")
             return 0
 
     # ---------- 生命周期 ----------
@@ -138,8 +141,9 @@ class PreviewScheduler:
                        self.file.start_piece + max(0, end_byte - 1) // pl)
             for p in range(first, last + 1):
                 self.handle.set_piece_deadline(p, 0)
-        except Exception:
-            pass
+        except Exception as e:
+            log_warning("scheduler.request_range",
+                        f"{start_byte}-{end_byte}: {e}")
 
     def seek_to_byte(self, byte_offset: int) -> None:
         """播放位置跳转后，从对应 piece 重新开始预约。"""
@@ -171,8 +175,8 @@ class PreviewScheduler:
         for p in range(start, target + 1):
             try:
                 self.handle.set_piece_deadline(p, 0)
-            except Exception:
-                pass
+            except Exception as e:
+                log_warning("scheduler.tick.deadline", f"piece={p}: {e}")
         self._scheduled_to = max(self._scheduled_to, target - 1)
 
     def buffer_progress(self) -> float:
@@ -182,16 +186,21 @@ class PreviewScheduler:
         return min(1.0, self.contiguous_progress() / self.file.size)
 
     def stop(self) -> None:
-        """取消预览：清空 deadline、全部文件优先级置 0 并暂停。"""
+        """取消预览：清空 deadline、全部文件优先级置 0 并暂停。
+
+        同时撤掉 auto_managed：libtorrent 的队列管理（active_downloads）
+        可能自动 resume 处于 paused 的种子，导致「停止预览」后仍在后台续传。
+        """
         if self.handle is not None:
             try:
                 self.handle.clear_piece_deadlines()
                 ti = self.handle.torrent_file()
                 if ti is not None:
                     self.handle.prioritize_files([0] * ti.num_files())
+                    self.handle.unset_flags(lt.torrent_flags.auto_managed)
                 self.handle.pause()
-            except Exception:
-                pass
+            except Exception as e:
+                log_warning("scheduler.stop", f"{e}")
         self.handle = None
         self.file = None
         self._scheduled_to = -1

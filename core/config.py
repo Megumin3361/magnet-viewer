@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 from PySide6.QtCore import QSettings
 
@@ -17,6 +18,9 @@ DEFAULTS: dict = {
     "metadata_timeout": 90,        # 磁力链元数据获取超时（秒）
     "cache_dir": "",               # 空 = 系统临时目录/magnet_viewer_cache
     "clear_cache_on_exit": False,  # 退出时清理预览缓存
+    "default_concurrency": 3,      # 默认并发下载数
+    "download_dir": "",            # 空 = 缓存目录/downloads
+    "seed_after_complete": False,  # 任务完成后继续做种（MVP 默认不做种）
 }
 
 _TYPES: dict = {
@@ -24,6 +28,8 @@ _TYPES: dict = {
     "metadata_timeout": int,
     "proxy_peer": bool,
     "clear_cache_on_exit": bool,
+    "default_concurrency": int,
+    "seed_after_complete": bool,
 }
 
 # libtorrent settings_pack::proxy_type_t 的整型值（2.1.x 仍是稳定枚举）
@@ -51,6 +57,11 @@ class AppConfig:
 
     def as_dict(self) -> dict:
         return {k: self.get(k) for k in DEFAULTS}
+
+    def default_download_dir(self, cache_dir: str) -> str:
+        """任务默认保存目录：设置 download_dir 优先，留空 = 缓存目录/downloads。"""
+        return (str(self.get("download_dir") or "").strip()
+                or os.path.join(str(cache_dir or ""), "downloads"))
 
     # ---- 派生配置 ----
 
@@ -96,8 +107,11 @@ def lt_proxy_settings(proxy: dict | None) -> dict:
     t = str(p.get("type", "none") or "none").lower()
     host = str(p.get("host") or "").strip()
     if t not in ("socks5", "http") or not host:
+        # 直连分支必须同时重置 tracker 连接设置——否则从代理切回直连后，
+        # tracker 仍走旧代理（已实证的残留缺陷）
         return {"proxy_type": LT_PROXY_TYPES["none"],
-                "proxy_peer_connections": False}
+                "proxy_peer_connections": False,
+                "proxy_tracker_connections": False}
     user, password = str(p.get("user") or ""), str(p.get("pass") or "")
     if user:
         t = {"socks5": "socks5_pw", "http": "http_pw"}[t]

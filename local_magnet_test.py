@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import libtorrent as lt  # noqa: E402
 
 from core.fetcher import SessionManager  # noqa: E402
-from core.models import human_size  # noqa: E402
+from core.models import file_disk_path, human_size  # noqa: E402
 
 SEED_PORT, PEER_PORT = 6901, 6902
 TIMEOUT_META, TIMEOUT_DATA = 60, 40
@@ -132,7 +132,11 @@ def main():
 
     ok_data = done >= vid.size
     print(f"\n[6] 预览文件下载{'完成' if ok_data else '未达预期'}：{human_size(done)}/{human_size(vid.size)}")
-    disk = os.path.join(mgr.cache_dir, *vid.path.split("/"))
+    # 目录隔离（决策 D7）：review/预览落盘 cache_dir/.preview/<ih>/
+    # （r.save_subdir 由 SessionManager 注入；接口未变，仅断言路径随布局更新）
+    save_dir = os.path.join(mgr.cache_dir, *r.save_subdir.split("/")) \
+        if getattr(r, "save_subdir", "") else mgr.cache_dir
+    disk = file_disk_path(save_dir, vid)
     ok_disk = os.path.isfile(disk) and os.path.getsize(disk) == vid.size
     print(f"    磁盘文件一致：{ok_disk}（{disk}）")
 

@@ -10,9 +10,14 @@ from .models import ParseResult, TorrentFile, safe_rel_path
 
 # ---------------- bencode ----------------
 
+MAX_TORRENT_SIZE = 32 * 1024 * 1024   # .torrent 文件大小上限（正常远小于 1MB）
+MAX_BENCODE_DEPTH = 64                 # 嵌套深度上限（防递归炸弹）
+MAX_INT_DIGITS = 32                    # 整数位数上限（防超长数字的二次复杂度解析）
+
+
 def bdecode(data: bytes):
     """解码 bencode 数据，返回 Python 对象（int / bytes / list / dict）。"""
-    value, _ = _decode(data, 0)
+    value, _ = _decode(data, 0, 0)
     return value
 
 
@@ -36,26 +41,34 @@ def bencode(obj) -> bytes:
     raise TypeError(f"unsupported type: {type(obj)}")
 
 
-def _decode(data: bytes, i: int):
+def _decode(data: bytes, i: int, depth: int):
+    if depth > MAX_BENCODE_DEPTH:
+        raise ValueError("bencode 嵌套过深（疑似深度炸弹）")
     c = data[i:i + 1]
     if c == b"d":
         d, i = {}, i + 1
         while data[i:i + 1] != b"e":
-            key, i = _decode(data, i)
-            val, i = _decode(data, i)
+            key, i = _decode(data, i, depth + 1)
+            val, i = _decode(data, i, depth + 1)
             d[key] = val
         return d, i + 1
     if c == b"l":
         lst, i = [], i + 1
         while data[i:i + 1] != b"e":
-            val, i = _decode(data, i)
+            val, i = _decode(data, i, depth + 1)
             lst.append(val)
         return lst, i + 1
     if c == b"i":
         j = data.index(b"e", i)
-        return int(data[i + 1:j]), j + 1
+        raw = data[i + 1:j]
+        if len(raw) > MAX_INT_DIGITS:
+            raise ValueError("bencode 整数过长")
+        return int(raw), j + 1
     j = data.index(b":", i)
-    n = int(data[i:j])
+    raw_len = data[i:j]
+    if len(raw_len) > MAX_INT_DIGITS:
+        raise ValueError("bencode 长度字段过长")
+    n = int(raw_len)
     return data[j + 1:j + 1 + n], j + 1 + n
 
 
@@ -98,7 +111,12 @@ def is_pure_v2(info: dict) -> bool:
 def parse_torrent_file(path: str) -> ParseResult:
     """解析 .torrent 文件，返回 ParseResult（含每文件的 piece 区间）。"""
     with open(path, "rb") as fp:
-        t = bdecode(fp.read())
+        raw = fp.read()
+    if len(raw) > MAX_TORRENT_SIZE:
+        raise ValueError(
+            f".torrent 文件过大（{len(raw) / 1024 / 1024:.1f} MB，"
+            f"上限 {MAX_TORRENT_SIZE // 1024 // 1024} MB），拒绝解析")
+    t = bdecode(raw)
     info = t[b"info"]
     name = safe_rel_path(_s(info.get(b"name", b"unknown")))
     piece_len = int(info.get(b"piece length", 16384))

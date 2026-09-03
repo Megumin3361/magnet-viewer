@@ -33,7 +33,8 @@ class VideoPreviewWidget(QWidget):
         self.player.setVideoOutput(self.video)
 
         self.title = QLabel("（未在播放）")
-        self.title.setStyleSheet("color:#555; padding:4px 2px;")
+        self._title_style = "color:#555; padding:4px 2px;"
+        self.title.setStyleSheet(self._title_style)
 
         self.buffer_bar = QProgressBar(self)
         self.buffer_bar.setRange(0, 1000)
@@ -82,9 +83,27 @@ class VideoPreviewWidget(QWidget):
         self._click_timer.setInterval(400)
         self._click_timer.timeout.connect(self._on_click_seek)
         self.slider.valueChanged.connect(self._on_value_changed)
-        self.btn_pause_text = True
 
     # ---------- 外部接口 ----------
+
+    def _set_play_btn(self, enabled: bool, playing: bool | None = None):
+        """播放按钮三态：无源/等待期禁用，播放中/暂停分别显示「暂停/播放」。"""
+        self.btn_play.setEnabled(enabled)
+        if playing is None:
+            self.btn_play.setText("播放")
+        else:
+            self.btn_play.setText("暂停" if playing else "播放")
+
+    def show_error(self, message: str):
+        """把错误显示到醒目的标题区（避免只写底部小字被用户忽略）。"""
+        self.title.setStyleSheet(
+            "color:#c62828; padding:4px 2px; font-weight:600;")
+        self.title.setText(f"⚠ {message}")
+        self.buffer_label.setText(f"播放器错误：{message}")
+
+    def _restore_title(self, text: str):
+        self.title.setStyleSheet(self._title_style)
+        self.title.setText(text)
 
     def set_waiting(self, name: str, size: int):
         """等待头部数据与索引块落盘（不开始播放，避免读到稀疏零数据/探测不到 moov）。"""
@@ -93,9 +112,10 @@ class VideoPreviewWidget(QWidget):
         self.player.stop()
         self.player.setSource(QUrl())
         self.slider.setRange(0, 0)
-        self.title.setText(
+        self._restore_title(
             f"缓冲中，等待数据与索引块就绪：{name}（{human_size(size)}）")
         self.buffer_label.setText("准备中…")
+        self._set_play_btn(False)   # 等待期不可播放，避免点击无效却改文案
 
     def set_stream(self, url: str, name: str, size: int):
         self.file_name = name
@@ -104,7 +124,7 @@ class VideoPreviewWidget(QWidget):
         self.slider.setRange(0, 0)
         self.player.setSource(QUrl(url))
         self.player.play()
-        self.btn_play.setText("暂停")
+        self._set_play_btn(True, True)
 
     def update_buffer(self, progress: float, rate: int):
         self.buffer_bar.setValue(int(progress * 1000))
@@ -117,24 +137,27 @@ class VideoPreviewWidget(QWidget):
     def stop(self):
         self.player.stop()
         self.player.setSource(QUrl())
-        self.title.setText("（未在播放）")
+        self._restore_title("（未在播放）")
         self.buffer_bar.setValue(0)
         self.buffer_label.setText("缓冲 0.0%")
+        self._set_play_btn(False)
 
     # ---------- 内部 ----------
 
     def _on_player_error(self, error, message: str):
-        self.buffer_label.setText(f"播放器错误：{message}")
-        if error != QMediaPlayer.NoError:
-            self.stream_failed.emit()
+        if error == QMediaPlayer.NoError:
+            return
+        self.show_error(message)
+        self._set_play_btn(False)
+        self.stream_failed.emit()
 
     def _toggle_play(self):
         if self.player.playbackState() == QMediaPlayer.PlayingState:
             self.player.pause()
-            self.btn_play.setText("播放")
+            self._set_play_btn(True, False)
         else:
             self.player.play()
-            self.btn_play.setText("暂停")
+            self._set_play_btn(True, True)
 
     def _on_seek(self):
         if self.slider.maximum() > 0:

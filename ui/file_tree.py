@@ -1,15 +1,16 @@
-"""文件树视图：目录层级 + 大小/占比 + 双击预览。"""
+"""文件树视图：目录层级 + 大小/占比 + 双击预览 + 右键添加下载。"""
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QStandardItem, QStandardItemModel
-from PySide6.QtWidgets import QTreeView
+from PySide6.QtWidgets import QMenu, QTreeView
 
 from core.models import ParseResult, TorrentFile, human_size
 
 
 class FileTreeWidget(QTreeView):
-    file_activated = Signal(object)  # TorrentFile
+    file_activated = Signal(object)          # TorrentFile（双击预览）
+    add_download_requested = Signal(object)  # TorrentFile（右键添加下载）
 
     COL_NAME, COL_SIZE, COL_RATIO = 0, 1, 2
 
@@ -21,6 +22,8 @@ class FileTreeWidget(QTreeView):
         self.setUniformRowHeights(True)
         self.setExpandsOnDoubleClick(False)
         self.doubleClicked.connect(self._on_double_clicked)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
         header = self.header()
         header.resizeSection(0, 460)
         header.resizeSection(1, 110)
@@ -81,3 +84,52 @@ class FileTreeWidget(QTreeView):
         f = item.data(Qt.UserRole)
         if isinstance(f, TorrentFile) and f.is_previewable:
             self.file_activated.emit(f)
+
+    # ---------- 右键菜单 ----------
+
+    def _file_at(self, pos) -> TorrentFile | None:
+        index = self.indexAt(pos)
+        if not index.isValid():
+            return None
+        item = self._model.itemFromIndex(index.siblingAtColumn(0))
+        f = item.data(Qt.UserRole) if item is not None else None
+        return f if isinstance(f, TorrentFile) else None
+
+    def _show_context_menu(self, pos):
+        f = self._file_at(pos)
+        if f is None or not f.is_previewable:
+            return
+        menu = QMenu(self)
+        act = menu.addAction("⬇ 添加下载（整个种子）")
+        if menu.exec(self.viewport().mapToGlobal(pos)) is act:
+            self.add_download_requested.emit(f)
+
+    # ---------- 定位 ----------
+
+    def select_file(self, f: TorrentFile) -> bool:
+        """定位并选中文件树中指定文件（供「打开预览」从下载页跳转）。"""
+        for row in range(self._model.rowCount()):
+            item = self._model.item(row, 0)
+            if item is None:
+                continue
+            if item.data(Qt.UserRole) is f:
+                idx = self._model.indexFromItem(item)
+                self.setCurrentIndex(idx)
+                self.scrollTo(idx)
+                return True
+        # 文件可能挂在深层目录：递归查找
+        return self._select_recursive(self._model.invisibleRootItem(), f)
+
+    def _select_recursive(self, parent, f: TorrentFile) -> bool:
+        for row in range(parent.rowCount()):
+            item = parent.child(row, 0)
+            if item is None:
+                continue
+            if item.data(Qt.UserRole) is f:
+                idx = self._model.indexFromItem(item)
+                self.setCurrentIndex(idx)
+                self.scrollTo(idx)
+                return True
+            if item.hasChildren() and self._select_recursive(item, f):
+                return True
+        return False

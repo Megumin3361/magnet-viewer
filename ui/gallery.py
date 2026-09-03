@@ -9,7 +9,8 @@ from PySide6.QtWidgets import (QHBoxLayout, QLabel, QListWidget,
                                QListWidgetItem, QPushButton, QSplitter,
                                QVBoxLayout, QWidget)
 
-from core.models import ParseResult, TorrentFile, file_disk_path, human_size
+from core.models import (ParseResult, TorrentFile, disk_root,
+                         file_disk_path, human_size)
 
 
 class GalleryWidget(QWidget):
@@ -74,7 +75,12 @@ class GalleryWidget(QWidget):
             item.setData(Qt.UserRole, f)
             self.thumb_list.addItem(item)
         if self._files:
+            # 定位到首图但不触发 currentRowChanged —— 解析完成不应自动下载首图
+            # （未下载图片的浏览是用户主动行为，见 _show_index）
+            self.thumb_list.blockSignals(True)
             self.thumb_list.setCurrentRow(0)
+            self.thumb_list.blockSignals(False)
+            self.viewer.setText("（选择左侧图片，或双击文件树中的图片浏览）")
         else:
             self.viewer.setText("该资源中没有图片文件")
             self.info_label.setText("")
@@ -91,6 +97,18 @@ class GalleryWidget(QWidget):
 
     # ---------- 内部 ----------
 
+    def _disk_root(self) -> str:
+        """任务落盘根目录（cache_dir + save_subdir）。
+
+        历史缺陷：此前直接用 ``result.cache_dir`` 拼路径，任务隔离子目录
+        （.preview/<ih> / downloads/<ih>）被漏掉，磁盘路径恒不存在，
+        已下载图片永远显示"下载中…"（P0-2）。
+        """
+        if self._result is None:
+            return ""
+        return disk_root(self._result.cache_dir or "",
+                         getattr(self._result, "save_subdir", ""))
+
     def _poll_completed(self):
         """周期检查：图片文件下载完成后自动载入缩略图。"""
         if self._result is None:
@@ -100,7 +118,7 @@ class GalleryWidget(QWidget):
             if row in self._loaded or f.index >= len(progress):
                 continue
             if progress[f.index] >= f.size > 0:
-                path = file_disk_path(self._result.cache_dir, f)
+                path = file_disk_path(self._disk_root(), f)
                 if os.path.isfile(path):
                     self._load_thumb(row, path)
 
@@ -114,12 +132,15 @@ class GalleryWidget(QWidget):
         item.setIcon(QIcon(pm.scaled(
             160, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation)))
         item.setText(f"{f.name}\n{human_size(f.size)}")
+        if row == self.thumb_list.currentRow():
+            # 当前正在浏览的图片刚下载完成 → 大图区立即刷新（此前显示"下载中…"）
+            self._show_index(row)
 
     def _show_index(self, row: int):
         if not (0 <= row < len(self._files)) or self._result is None:
             return
         f = self._files[row]
-        path = file_disk_path(self._result.cache_dir, f)
+        path = file_disk_path(self._disk_root(), f)
         self._scale = 1.0
         if os.path.isfile(path):
             self._pixmap = QPixmap(path)

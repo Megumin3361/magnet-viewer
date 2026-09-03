@@ -17,7 +17,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from core.config import RECENT_LIMIT  # noqa: E402
+from core.config import RECENT_LIMIT, AppConfig, DEFAULTS  # noqa: E402
 from core.parser import parse_torrent_file  # noqa: E402
 from ui.main_window import MainWindow  # noqa: E402
 
@@ -33,9 +33,33 @@ def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     tmp = tempfile.mkdtemp(prefix="mv_gui_")
 
+    # ---------------------------------------------------------------- [0] 设置接线
+    # 回归 P0-3：设置面板的「默认下载目录」「默认并发下载数」必须真正生效。
+    # MainWindow 构造前写入测试配置，构造后断言，finally 恢复用户全部设置。
+    print("\n[0] 设置接线：默认下载目录 / 默认并发下载数（P0-3 回归）")
+    cfg0 = AppConfig()
+    _orig_all = {k: cfg0.get(k) for k in DEFAULTS}
+    dl_out = os.path.join(tmp, "dl_outside")
+    os.makedirs(dl_out, exist_ok=True)
+    cfg0.set("download_dir", dl_out)
+    cfg0.set("default_concurrency", 5)
+    w = None
+    try:
+        w = MainWindow()
+        check(os.path.normpath(w.session.download_dir) == os.path.normpath(dl_out),
+              "download_dir 设置已接入 SessionManager")
+        check(w.session._active_downloads == 5,
+              "default_concurrency 设置已接入 SessionManager")
+        bases = w.server._httpd.RequestHandlerClass.base_dirs
+        check(any(os.path.normpath(b) == os.path.normpath(dl_out) for b in bases),
+              "StreamServer base_dirs 含 download_dir（多根）")
+    finally:
+        for k, v in _orig_all.items():
+            cfg0.set(k, v)
+    check(w is not None, "MainWindow 构造成功（配置恢复后仍可继续测试）")
+
     # ---------------------------------------------------------------- [1] 实例化
     print("\n[1] MainWindow 实例化")
-    w = MainWindow()
     w.show()
     app.processEvents()
     check(w.windowTitle().startswith("磁力链"), "窗口标题正常")
@@ -82,17 +106,28 @@ def main() -> int:
     check(w.input.completer().model() is w._recent_model,
           "completer 使用 _recent_model")
 
-    sample = [f"magnet:?xt=urn:btih:{i:040d}" for i in range(3)]
-    cur = list(w.cfg.recent())
-    for s in sample:
-        cur = w.cfg.push_recent(s)
-    check(cur[:3] == sample[::-1], "新条目置顶（去重 + 逆序）")
-    check(len(cur) <= RECENT_LIMIT, f"历史条数 {len(cur)} <= {RECENT_LIMIT}")
+    # 历史测试会写入真实 QSettings（注册表）：先备份，结束后恢复，避免污染用户历史
+    import json as _json
+    from core.config import AppConfig as _AppConfig
+    _save_cfg = _AppConfig()
+    _orig_recent = _save_cfg.recent()
+    try:
+        sample = [f"magnet:?xt=urn:btih:{i:040d}" for i in range(3)]
+        cur = list(w.cfg.recent())
+        for s in sample:
+            cur = w.cfg.push_recent(s)
+        check(cur[:3] == sample[::-1], "新条目置顶（去重 + 逆序）")
+        check(len(cur) <= RECENT_LIMIT, f"历史条数 {len(cur)} <= {RECENT_LIMIT}")
 
-    for i in range(RECENT_LIMIT + 10):
-        cur = w.cfg.push_recent(f"item-{i}")
-    check(len(cur) == RECENT_LIMIT, f"历史上限生效：{len(cur)} == {RECENT_LIMIT}")
-    check(w.cfg.recent() == cur, "QSettings 持久化读回一致")
+        for i in range(RECENT_LIMIT + 10):
+            cur = w.cfg.push_recent(f"item-{i}")
+        check(len(cur) == RECENT_LIMIT, f"历史上限生效：{len(cur)} == {RECENT_LIMIT}")
+        check(w.cfg.recent() == cur, "QSettings 持久化读回一致")
+    finally:
+        _save_cfg.set("recent", _json.dumps(_orig_recent, ensure_ascii=False))
+        print("  [OK] QSettings 历史已恢复（不污染用户数据）"
+              if w.cfg.recent() == _orig_recent
+              else "  [FAIL] QSettings 历史恢复失败")
 
     # ---------------------------------------------------------------- [4] 文件树
     print("\n[4] 文件树")
@@ -175,6 +210,75 @@ def main() -> int:
             w.cache_dir, *sample.path.split("/")))
         check(expect in w._path_to_file,
               f"可按绝对路径命中文件（{sample.name}）")
+
+    # ---------------------------------------------------------------- [4b] 清理保留名单
+    print("\n[4b] 清理缓存保留名单（P0-1 回归）")
+    from core.cache_guard import (clear_cache_contents,  # noqa: E402
+                                  ensure_cache_dir)
+    cache_c = os.path.join(tmp, "cache_clean")
+    ensure_cache_dir(cache_c)
+    for rel in ("downloads/t1", ".resume", ".preview/ih1"):
+        os.makedirs(os.path.join(cache_c, *rel.split("/")), exist_ok=True)
+    with open(os.path.join(cache_c, ".tasks.json"), "w") as f:
+        f.write("{}")
+    with open(os.path.join(cache_c, "scatter.bin"), "w") as f:
+        f.write("x")
+    n = clear_cache_contents(cache_c)
+    check(n >= 2, f"清除条目数 {n} >= 2（.preview 与散文件）")
+    check(os.path.isdir(os.path.join(cache_c, "downloads")),
+          "downloads/ 保留（用户下载数据）")
+    check(os.path.isfile(os.path.join(cache_c, ".tasks.json")),
+          ".tasks.json 保留（任务清单）")
+    check(os.path.isdir(os.path.join(cache_c, ".resume")),
+          ".resume/ 保留（续传数据）")
+    check(not os.path.exists(os.path.join(cache_c, ".preview")),
+          ".preview/ 已清除")
+    check(not os.path.exists(os.path.join(cache_c, "scatter.bin")),
+          "散文件已清除")
+
+    # 设置对话框「立即清理缓存」路径：必须同样走保留名单（不误删下载数据）
+    import ui.settings_dialog as _sd  # noqa: E402
+    _sd.QMessageBox.information = staticmethod(lambda *a, **k: None)
+    _sd.QMessageBox.warning = staticmethod(lambda *a, **k: None)
+    os.makedirs(os.path.join(cache_c, ".preview", "ih2"), exist_ok=True)
+    dlg = _sd.SettingsDialog(AppConfig(), cache_c, on_clear_cache=None,
+                             parent=w)
+    dlg.cache_edit.setText(cache_c)
+    dlg._clear_cache()
+    check(os.path.isdir(os.path.join(cache_c, "downloads")),
+          "SettingsDialog 清理后 downloads/ 仍保留（P0-1 不误删下载数据）")
+    check(os.path.isfile(os.path.join(cache_c, ".tasks.json")),
+          "SettingsDialog 清理后 .tasks.json 仍保留")
+    check(not os.path.exists(os.path.join(cache_c, ".preview")),
+          "SettingsDialog 清理已清除预览缓存")
+
+    # ---------------------------------------------------------------- [4c] 画廊隔离路径
+    print("\n[4c] 画廊磁盘路径拼接（P0-2 回归）")
+    import base64  # noqa: E402
+    from core.models import ParseResult, TorrentFile  # noqa: E402
+    from ui.gallery import GalleryWidget  # noqa: E402
+    png_1x1 = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+        "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+    ih2 = "cd" * 20
+    sub2 = f".preview/{ih2}"
+    gcache = os.path.join(tmp, "cache_gallery")
+    pic_rel = "root/pics/a.png"
+    pic_path = os.path.join(gcache, *sub2.split("/"), *pic_rel.split("/"))
+    os.makedirs(os.path.dirname(pic_path), exist_ok=True)
+    with open(pic_path, "wb") as f:
+        f.write(png_1x1)
+    gf = TorrentFile(0, pic_rel, len(png_1x1), 0, 0, 0)
+    gres = ParseResult(info_hash=ih2, name="root", total_size=len(png_1x1),
+                       piece_size=1024, num_pieces=1, files=[gf],
+                       source="magnet", cache_dir=gcache, save_subdir=sub2)
+    gal = GalleryWidget()
+    gal.set_result(gres)
+    gal._show_index(0)
+    check(gal._pixmap is not None and not gal._pixmap.isNull(),
+          "画廊大图从隔离路径加载成功（save_subdir 已拼接）")
+    check(gal.viewer.pixmap() is not None,
+          "大图区已渲染 pixmap（不再停留「下载中…」）")
 
     # ---------------------------------------------------------------- [5] 清理
     print("\n[5] 收尾")

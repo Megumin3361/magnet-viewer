@@ -120,7 +120,14 @@ def main() -> int:
     print("\n[5] 路径映射（此前失效的环节）")
     check(r.cache_dir == os.path.abspath(cache),
           f"cache_dir 已注入且一致：{r.cache_dir}")
-    path_map = {os.path.normpath(file_disk_path(mgr.cache_dir, f)): f
+    # 目录隔离（决策 D7）：解析/预览落盘 cache_dir/.preview/<ih>/
+    # （r.save_subdir 由 SessionManager 注入；接口未变，仅断言路径随布局更新）
+    save_dir = os.path.join(mgr.cache_dir, *r.save_subdir.split("/")) \
+        if getattr(r, "save_subdir", "") else mgr.cache_dir
+    check(save_dir != mgr.cache_dir and save_dir.startswith(os.path.join(
+        mgr.cache_dir, ".preview")),
+        f"save_subdir 已注入（.preview/<ih> 隔离）：{r.save_subdir}")
+    path_map = {os.path.normpath(file_disk_path(save_dir, f)): f
                 for f in r.files}
     check(all(os.path.isabs(k) for k in path_map),
           f"全部 {len(path_map)} 个映射键均为绝对路径")
@@ -129,7 +136,7 @@ def main() -> int:
     if vid is None:
         mgr.shutdown()
         return 1
-    vid_disk = os.path.normpath(file_disk_path(mgr.cache_dir, vid))
+    vid_disk = os.path.normpath(file_disk_path(save_dir, vid))
     check(vid_disk in path_map, f"可按绝对路径命中预览目标（{vid.name}）")
 
     # ---- 边下边播 ----
@@ -171,7 +178,10 @@ def main() -> int:
 
     srv = StreamServer(mgr.cache_dir, pieces_cb=pieces_cb)
     srv.start()
-    url = srv.url_for(vid.path)
+    # 目录隔离（D7）：服务相对路径要带上 save_subdir 前缀才能命中真实文件
+    rel = "/".join([s for s in r.save_subdir.split("/") if s] + [vid.path]) \
+        if getattr(r, "save_subdir", "") else vid.path
+    url = srv.url_for(rel)
     req = urllib.request.Request(url, headers={"Range": "bytes=0-65535"})
     with urllib.request.urlopen(req, timeout=10) as resp:
         body = resp.read()
