@@ -1,10 +1,13 @@
-"""7 套旧测试回归运行器：一键全量回归，汇总退出码。
+"""8 套测试回归运行器：一键全量回归，汇总退出码。
 
-依据 README.md:90 退出码约定与 t4_acceptance_plan.md 回归契约（D4）：
+依据 README.md 退出码约定与 t4_acceptance_plan.md 回归契约（D4）：
 下载管理模块改造后必须保证 7 套旧测试全绿（0=通过 / 1=失败 / 2=SKIP）。
 
+套件构成：前 7 套为旧测试兼容契约（解析/流媒体/GUI），
+第 8 套 `download_mgr_test` 为下载管理模块验收（约 2 分钟，含本机做种闭环）。
+
 用法：
-    python regression_run.py            # 全量 7 套
+    python regression_run.py            # 全量 8 套
     python regression_run.py smoke      # 单套（按名字前缀匹配）
 
 退出码：任一测试 FAIL(1) → 本脚本退出 1；全部通过(0) → 0；
@@ -19,6 +22,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# 前 7 套 = 旧测试兼容契约；末套 = 下载管理模块验收（纳入以保证「全量回归」不漏新功能）
 SUITES = [
     "smoke_test",
     "local_magnet_test",
@@ -27,6 +31,7 @@ SUITES = [
     "gui_feature_test",
     "moov_stream_test",
     "qt_stream_open_test",
+    "download_mgr_test",
 ]
 
 NAME = {

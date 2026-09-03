@@ -83,6 +83,9 @@ class MainWindow(QMainWindow):
         self.session.on_error = self.bridge.resolve_failed.emit
 
         self._path_to_file: dict[str, TorrentFile] = {}  # 磁盘路径 -> 文件
+        # 分块映射未命中告警节流：_pieces_map 每个 HTTP 请求都会调用，
+        # 同一路径只告警一次，避免日志被刷屏
+        self._map_miss_warned: set[str] = set()
         # 流服务多根：download_dir 配置在缓存目录之外时，下载任务文件的
         # 分块级可用性判定/按需补拉仍须可服务（url_for 携带绝对落盘路径）。
         self.server = StreamServer(
@@ -395,6 +398,7 @@ class MainWindow(QMainWindow):
             os.path.normpath(file_disk_path(save_dir, f)): f
             for f in res.files
         }
+        self._map_miss_warned.clear()   # 新种子：重置未命中告警节流
         self.tree.populate(res)
         self.preview.gallery.set_result(res)
         self.tabs.setTabEnabled(TAB_PREVIEW, True)
@@ -429,6 +433,7 @@ class MainWindow(QMainWindow):
             os.path.normpath(file_disk_path(save_dir, f)): f
             for f in result.files
         }
+        self._map_miss_warned.clear()   # 新种子：重置未命中告警节流
         self.tree.populate(result)
         self.preview.gallery.set_result(result)
         self.tabs.setTabEnabled(TAB_PREVIEW, True)
@@ -517,8 +522,17 @@ class MainWindow(QMainWindow):
         pm = self.session.piece_map_for_path(disk_path)
         if pm is not None:
             return pm
-        f = self._path_to_file.get(os.path.normpath(disk_path))
+        key = os.path.normpath(disk_path)
+        f = self._path_to_file.get(key)
         if f is None:
+            # 未命中 → 流服务降级为「按整文件服务」。若该文件仍在下载中，
+            # 会把未下载的稀疏零数据喂给播放器（历史 P3-2 缺陷的同一机制）。
+            # 此前此处完全静默，是排查该缺陷耗时过长的直接原因，必须留痕。
+            if key not in self._map_miss_warned:
+                self._map_miss_warned.add(key)
+                log_warning("main_window.pieces_map.miss",
+                            f"分块映射未命中：{disk_path} —— 将按整文件服务，"
+                            f"若仍在下载中会把稀疏零数据喂给播放器")
             return None
         pl = self.session.piece_length()
         if not pl:

@@ -63,11 +63,19 @@
 | §6 退出重启续传：.tasks.json+fastresume 读回、上传增量证不重下（MVP6） | 9 | ✅ |
 | §7 完成：落盘字节=声明值、state=COMPLETED（MVP7） | 4 | ✅ |
 | §8 多任务并发：2 种子同时下载均 100%（增强1） | 4 | ✅ |
-| §9 带宽限制：download_rate ≤ 设定值 ±20%（增强2） | 4 | ✅ |
+| §9 libtorrent 会话级限速能力验证（增强2，见下方注解） | 4 | ✅ |
 | §10 边界：重复 hash / per-task 看门狗 / 防穿越 / resume 损坏重建 / 缓存被清 | 15 | ✅ |
-| 合计 | **68** | **0 FAIL，退出码 0** |
+| §11 下载中任务流服务安全（防 partial file 回归，补充段） | 11 | ✅ |
+| 合计 | **79** | **0 FAIL，退出码 0** |
 
-回归：`python regression_run.py`（smoke / local_magnet / local_torrent / single_file / gui_feature / moov / qt）——**全部通过**。
+> **§9 注解（重要，防误读）**：该段验证的是 **libtorrent 底层的会话级限速能力**
+> （`session.apply_settings({"download_rate_limit": ...})`）确实生效，
+> 为后续功能提供技术依据。**它不等于「限速功能已实现」**——
+> 截至本次复查，应用层**没有限速配置项、也没有设置面板入口**（见下节第 7 项）。
+> 另：合计由 68 项更正为 **79 项**（补充的 §11 段此前未回写本表）。
+
+回归：`python regression_run.py`——**8 套全绿**（原 7 套旧测试 + `download_mgr_test`
+已纳入 SUITES；此前只跑 7 套，存在回归盲区，已修正）。
 
 验收中定位并修复一处缺陷：`core/fetcher.py::_restore_task` 对损坏 fastresume 原实现会抛错并把任务标记 FAILED，违反 B3「损坏静默降级全新加入、绝不阻断启动」语义（模块 docstring 已声明）。已改为损坏时丢弃 resume data 走全新加入路径（契约不变）。
 
