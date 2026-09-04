@@ -9,6 +9,11 @@ jobs:
   regression:
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      # runner 系统 locale 为 cp1252，编不了脚本里的中文输出：
+      # 不强制 UTF-8 时 print 直接 UnicodeEncodeError，进程秒崩且不产日志
+      PYTHONUTF8: 1
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
 
