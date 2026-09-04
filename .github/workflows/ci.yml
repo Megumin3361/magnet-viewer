@@ -1,0 +1,38 @@
+name: Regression
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  regression:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      # runner 系统 locale 为 cp1252，编不了脚本里的中文输出：
+      # 不强制 UTF-8 时 print 直接 UnicodeEncodeError，进程秒崩且不产日志
+      PYTHONUTF8: 1
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt imageio-ffmpeg
+
+      - name: Run 8-suite regression
+        run: python regression_run.py
+
+      - name: Upload regression logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-logs
+          path: reg_*.log
+          retention-days: 7
