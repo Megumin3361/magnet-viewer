@@ -19,6 +19,8 @@ CRUD 的每条分支压一遍，秒级、不联网。
      selected_files/seed/error 覆盖）、R-3 结构证据（status() 在锁外——
      用「status() 里回头抢锁」探针钉死）、completed 强制 progress=1
 - §H Facade 接线：SessionManager 公开面真的打到 TaskOps（防假搬迁）
+- §K 删任务回绕（F2/F3）：孤儿 fastresume 回收（仅注册表再无同 key 记录时）、
+     D9 守卫拒删后空目录 rmdir 收尾（非空目录原样保留）
 
 退出码：0=通过，1=失败，2=SKIP（依赖缺失，绝不假装通过）。
 """
@@ -71,24 +73,39 @@ class FakeHandle:
         self.status_raises = False
         self.total_done = 0
         self.down_rate = 0
+        self.calls: list = []          # 全局有序调用记录（§I b③ 顺序断言）
 
     def info_hash(self):
         return self.ih
 
     def pause(self):
         self.paused += 1
+        self.calls.append("pause")
 
     def resume(self):
         self.resumed += 1
+        self.calls.append("resume")
 
     def set_flags(self, f):
         self.set_flags_calls.append(f)
+        self.calls.append(f"set:{_flag_name(f)}")
 
     def unset_flags(self, f):
         self.unset_flags_calls.append(f)
+        self.calls.append(f"unset:{_flag_name(f)}")
 
     def prioritize_files(self, prio):
         self.prioritized.append(list(prio))
+        self.calls.append("prioritize")
+
+    def clear_piece_deadlines(self):
+        self.calls.append("clear_deadlines")
+
+    def set_piece_deadline(self, piece, ms):
+        pass                          # scheduler.begin/tick 会调用（§I 真链路）
+
+    def have_piece(self, piece):
+        return False                  # 无落盘：first_missing 即播放起点
 
     def torrent_priority(self, p):
         self.torrent_priorities.append(p)
@@ -105,12 +122,24 @@ class FakeHandle:
         pass
 
 
+def _flag_name(f):
+    """libtorrent flag → 稳定短名（FakeHandle.calls 顺序断言用）。"""
+    if f == lt.torrent_flags.upload_mode:
+        return "upload_mode"
+    if f == lt.torrent_flags.auto_managed:
+        return "auto_managed"
+    return f"flag:{f}"
+
+
 class FakeTI:
     def __init__(self, n):
         self._n = n
 
     def num_files(self):
         return self._n
+
+    def piece_length(self):
+        return 16384
 
 
 class FakeStatus:
@@ -386,14 +415,18 @@ def section_remove(ck):
         ck.check(ses.removed[-1][1] == 1, "选项 1：libtorrent 删文件")
         ck.check(not os.path.isdir(managed), "受管目录名==任务键 → 删除")
 
-        # 守卫：目录名不符 → 拒绝
+        # 守卫：目录名不符 → 拒绝（F3 后：非空目录原样保留；空目录收尾见 §K）
         outside = os.path.join(dl, "user-data")
         os.makedirs(outside, exist_ok=True)
+        with open(os.path.join(outside, "user.bin"), "wb") as f:
+            f.write(b"u")           # 共享目录里的用户文件 → 守卫必须保留
         k2 = "8" * 40
         add_rec(reg, k2, download=True, save_path=outside)
         reg.tasks[k2] = {"info_hash": k2}
         ops.remove_task(k2, delete_files=True)
-        ck.check(os.path.isdir(outside), "目录名 != 任务键 → 拒绝删除（D9）")
+        ck.check(os.path.isdir(outside)
+                 and os.path.isfile(os.path.join(outside, "user.bin")),
+                 "目录名 != 任务键 → 拒绝删除（D9）")
         shutil.rmtree(outside)
 
         # 无 rec 有 task（重启后句柄失效残留）：也删清单
@@ -537,6 +570,303 @@ def section_facade(ck):
         shutil.rmtree(ws, ignore_errors=True)
 
 
+def section_lifecycle(ck):
+    ck.section("§I 转正生命周期（plan/06 阶段 B：convert/hold 两档，假句柄 + 真 SessionManager，不启会话）")
+    ws = tempfile.mkdtemp(prefix="mv_lifecycle_")
+    try:
+        cache = os.path.join(ws, "cache")
+        result = ParseResult(info_hash=IH, name="root", total_size=200,
+                             piece_size=16384, num_pieces=12,
+                             files=[TorrentFile(0, "root/a.bin", 100, 0, 0, 5),
+                                    TorrentFile(1, "root/b.bin", 100, 100,
+                                                6, 11)],
+                             source="magnet")
+
+        def mk_mgr(mode):
+            """fixture 走真 scheduler.begin()：转正前目标文件已被真实置 4
+            （审查 Minor-5 b①：让「优先级延续」命题被真实置位，而非手摆状态）。"""
+            mgr = SessionManager(cache)
+            mgr._cache_mode_get = lambda: mode
+            h = FakeHandle(IH, num_files=2)
+            rec = TaskRecord(handle=h, result=result, state="READY",
+                             save_path=mgr._preview_dir(IH))
+            with mgr._lock:
+                mgr._registry.put_record_locked(IH, rec, make_current=True)
+            mgr.start_preview(result.files[0])   # 真 begin()：置 [4,0]
+            return mgr, h, rec
+
+        # ---- convert 档：关预览自动转正 ----
+        mgr, h, rec = mk_mgr("convert")
+        mgr.stop_preview()
+        ck.check(h.paused == 0, "convert：pause() 零调用（不冻结，引擎继续全量缓存）")
+        # 审查 Minor-5 b②：正向断言 prioritized 序列——release/转正路径
+        # prioritize_files 零调用，begin() 置下的 [4,0] 原样延续。
+        ck.check(h.prioritized == [[4, 0]],
+                 "convert：prioritized 全程仅 begin 的一次 [4,0]（停预览零重刷）")
+        ck.check(rec.download is True, "convert：rec 转正为下载任务（download=True）")
+        ck.check(IH in mgr._registry.tasks, "convert：任务清单 upsert 含该 ih")
+        ck.check(rec.save_path == mgr._preview_dir(IH),
+                 "convert：save_path 仍 .preview/<ih>（已落盘分块零重下）")
+        # 审查 Minor-5 b③：转正收尾的 libtorrent 交织序必须是
+        # unset(upload_mode) → set(auto_managed) → resume（顺序是优先级
+        # 生效前提：upload_mode 句柄上的 set_flags/resume 语义依赖该序）。
+        tail_i = (len(h.calls) - h.calls[::-1].index("clear_deadlines") - 1
+                  if "clear_deadlines" in h.calls else -1)
+        ck.check(tail_i >= 0
+                 and h.calls[tail_i + 1:] == ["unset:upload_mode",
+                                              "set:auto_managed", "resume"],
+                 f"convert：release→转正收尾交织序正确（实得 {h.calls[tail_i + 1:]}）")
+        # ---- F1（Critical-1 回归）：转正清单 selected == 实际下载集 ----
+        sel = mgr._registry.tasks.get(IH, {}).get("selected")
+        ck.check(sel == ["root/a.bin"],
+                 f"convert：selected=[预览文件]（实得 {sel}）——不再刷成全选")
+        # resume/重启路径：activate_download 默认（非 preserve）按 selected
+        # 重设 → 目标文件 4、其余 0，**不是全选 [4,4]**（迅雷语义：转正=继续
+        # 缓存正在预览的那一个文件）。
+        mgr._taskops.activate_download(rec)
+        ck.check(h.prioritized == [[4, 0], [4, 0]],
+                 f"convert：resume 重刷仍 [4,0]（实得 {h.prioritized}）")
+
+        # ---- hold 档：与基线逐字一致 ----
+        mgr2, h2, rec2 = mk_mgr("hold")
+        mgr2.stop_preview()
+        ck.check(h2.paused == 1, "hold：pause 恰一次（基线）")
+        ck.check(h2.prioritized == [[4, 0], [0, 0]],
+                 "hold：begin [4,0] 后 stop 全 0（基线）")
+        ck.check(lt.torrent_flags.auto_managed in h2.unset_flags_calls,
+                 "hold：撤 auto_managed（基线）")
+        ck.check(rec2.download is False and IH not in mgr2._registry.tasks,
+                 "hold：不转正、不进任务清单（基线）")
+
+        # ---- convert 档非转正场景：已是下载任务 → 只 release 不重复转正 ----
+        mgr3 = SessionManager(cache)
+        mgr3._cache_mode_get = lambda: "convert"
+        h3 = FakeHandle(IH2, num_files=2)
+        rec3 = TaskRecord(handle=h3, result=result, state=STATE_DOWNLOADING,
+                          download=True, save_path=mgr3._task_dir(IH2))
+        with mgr3._lock:
+            mgr3._registry.put_record_locked(IH2, rec3, make_current=True)
+        mgr3.start_preview(result.files[0])
+        before = dict(mgr3._registry.tasks)
+        mgr3.stop_preview()
+        ck.check(h3.paused == 0 and mgr3._registry.tasks == before
+                 and h3.prioritized == [[4, 0]],
+                 "convert：下载任务停预览只 release，不重复转正/不改清单")
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+def section_promote_cross_restart(ck):
+    ck.section("§J 转正跨重启/删任务回收闭环（plan/06 阶段 C C3，假句柄，不联网）")
+    ws = tempfile.mkdtemp(prefix="mv_promote_")
+
+    def _enforce(root, limit_mb, keep):
+        from core import cache_quota
+        return cache_quota.enforce_preview_limit(
+            root, limit_mb, keep_dirs=keep, warn=lambda m: None)
+
+    try:
+        cache = os.path.join(ws, "cache")
+        result = ParseResult(info_hash=IH, name="root", total_size=200,
+                             piece_size=16384, num_pieces=12,
+                             files=[TorrentFile(0, "root/a.bin", 100, 0, 0, 5),
+                                    TorrentFile(1, "root/b.bin", 100, 100,
+                                                6, 11)],
+                             source="magnet")
+        # ---- 1) convert 转正 → drain resume（真 TaskPersistence + 真 resume.py）----
+        mgr = SessionManager(cache)
+        mgr._cache_mode_get = lambda: "convert"
+        h = FakeHandle(IH, num_files=2)
+        saved: list = []
+        h.save_resume_data = lambda flags: saved.append(1)  # 记录转正收尾请求
+        rec = TaskRecord(handle=h, result=result, state="READY",
+                         save_path=mgr._preview_dir(IH))
+        with mgr._lock:
+            mgr._registry.put_record_locked(IH, rec, make_current=True)
+        mgr.start_preview(result.files[0])       # 真 begin()：置 [4,0]
+        mgr.stop_preview()                       # convert 转正
+        ck.check(rec.download and IH in mgr._registry.tasks,
+                 "转正：download=True 且进入任务清单")
+        ck.check(len(saved) >= 1,
+                 f"转正收尾 request_resume 打到句柄（实得 {len(saved)} 次）")
+        # drain 的等价闭环：save_resume_data_alert 数据流经真
+        # write_resume_from_alert → 真 resume.py 编解码写盘（tempfile 目录）。
+        class _Alert:
+            handle = h
+            resume_data = {b"save_path": rec.save_path.encode("utf-8"),
+                           b"peers": [], b"piece_bits": b"\xff"}
+        mgr._persist.write_resume_from_alert(_Alert())
+        rp = os.path.join(cache, ".resume", f"{IH}.fastresume")
+        ck.check(os.path.isfile(rp),
+                 f"fastresume 落盘 <cache>/.resume/{IH[:12]}….fastresume（真写盘）")
+        from core import persist as _p
+        from core.resume import decode_resume
+        raw = _p.read_resume(cache, IH)
+        ck.check(raw is not None
+                 and decode_resume(raw) == _Alert.resume_data,
+                 "fastresume 读回=写入（真 tempfile 目录编解码闭环）")
+
+        # ---- 2) 模拟 restore：safe_task_save_path 放行 .preview/<ih> ----
+        task = dict(mgr._registry.tasks[IH])
+        ck.check(_p.safe_task_save_path(cache, mgr.download_dir, IH,
+                                        task["save_path"])
+                 == os.path.normpath(os.path.abspath(mgr._preview_dir(IH))),
+                 "restore 消毒放行 .preview/<ih> save_path（is_within(cache_dir)"
+                 "成立——转正任务本就住那里，裁决=设计正确，非缺陷）")
+        restored_handle = FakeHandle(IH, num_files=2)
+
+        class _RestoreSes(FakeSes):
+            added_atp = None
+
+            def add_torrent(self, atp):
+                _RestoreSes.added_atp = atp
+                return restored_handle
+
+        class _RestoreLT:
+            """假 libtorrent：restore 磁力链分支只需 parse/read_resume_data。"""
+
+            @staticmethod
+            def parse_magnet_uri(src):
+                class P:
+                    save_path, ti, url, trackers = "", None, src, []
+                return P()
+
+            @staticmethod
+            def read_resume_data(b):
+                class RD:
+                    save_path, ti, url, trackers = "", None, "", []
+                return RD()
+
+        ses_restore = _RestoreSes()
+        orig_ses, orig_p_lt = mgr._ses, _p.lt
+        mgr._ses = ses_restore          # PersistDeps.ses_get 读宿主实时成员
+        _p.lt = _RestoreLT
+        try:
+            ok = mgr._persist.restore_task(task)
+        finally:
+            mgr._ses = orig_ses
+            _p.lt = orig_p_lt
+        ck.check(ok is True, "restore_task：转正任务恢复成功（假 lt/假会话）")
+        rec2 = mgr._registry.torrents[IH]
+        ck.check(os.path.normcase(rec2.save_path)
+                 == os.path.normcase(mgr._preview_dir(IH)),
+                 f"restore 后 rec.save_path 仍 .preview/<ih>"
+                 f"（实得 {rec2.save_path}）——零重下/保护名单一致")
+        ck.check(_RestoreSes.added_atp is not None
+                 and os.path.normcase(_RestoreSes.added_atp.save_path)
+                 == os.path.normcase(mgr._preview_dir(IH)),
+                 "atp.save_path 注入=原 .preview/<ih>（续传不另起目录）")
+        ck.check(os.path.normcase(mgr._preview_dir(IH)) in
+                 {os.path.normcase(p) for p in mgr.protected_dirs()},
+                 "restore 后的转正任务目录重新进入 protected_dirs()")
+
+        # ---- 3) 删任务（不删文件）→ 目录恢复可被 LRU 回收 ----
+        pdir = mgr._preview_dir(IH)
+        with open(os.path.join(pdir, "payload.bin"), "wb") as f:
+            f.write(b"z" * (1536 * 1024))      # 超 1MB 配额，触发回收
+        ck.check(mgr._taskops.remove_task(IH, delete_files=False) is True,
+                 "remove_task(delete_files=False) 成功")
+        ck.check(IH not in mgr._registry.torrents
+                 and IH not in mgr._registry.tasks,
+                 "删任务后注册表/清单均注销")
+        ck.check(os.path.isdir(pdir),
+                 "不删文件语义：.preview/<ih> 仍在磁盘（待 LRU 回收，非即时删）")
+        ck.check(pdir not in mgr.protected_dirs(),
+                 "删任务后目录退出 protected_dirs()（保护解除）")
+        quota_root = os.path.join(cache, ".preview")
+        total, freed0 = _enforce(quota_root, 0, set())
+        ck.check(freed0 == 0 and total >= 1536 * 1024,
+                 f"limit=0 只统计（total={total} freed={freed0}）")
+        _t, f2 = _enforce(quota_root, 1, mgr.protected_dirs())
+        ck.check(not os.path.isdir(pdir) and f2 >= 1536 * 1024,
+                 "删任务后 enforce_preview_limit 回收转正目录（LRU 复活）")
+
+        # ---- 4) D9 守卫核对：转正目录名==任务键，『删除任务和文件』放行 ----
+        IH4 = "de" * 20
+        mgr4 = SessionManager(cache)
+        mgr4._cache_mode_get = lambda: "convert"
+        h4 = FakeHandle(IH4, num_files=2)
+        rec4 = TaskRecord(handle=h4, result=ParseResult(
+            info_hash=IH4, name="root", total_size=200, piece_size=16384,
+            num_pieces=12, files=result.files, source="magnet"),
+            state="READY", save_path=mgr4._preview_dir(IH4))
+        with mgr4._lock:
+            mgr4._registry.put_record_locked(IH4, rec4, make_current=True)
+        os.makedirs(mgr4._preview_dir(IH4), exist_ok=True)
+        mgr4.start_preview(result.files[0])
+        mgr4.stop_preview()
+        ck.check(mgr4._taskops.remove_task(IH4, delete_files=True) is True,
+                 "D9：删任务+文件（转正目录名==任务键）入口放行")
+        ck.check(not os.path.isdir(mgr4._preview_dir(IH4)),
+                 "D9：转正的 .preview/<ih> 目录被守卫放行删除（非拒绝）")
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+def section_remove_wrapup(ck):
+    ck.section("§K 删任务回绕：孤儿 fastresume + 拒删空目录收尾（F2/F3）")
+    ws, cache, dl, reg, ses, sched, ops, persist = mk_env()
+    try:
+        from core.resume import resume_dir, resume_path
+        os.makedirs(resume_dir(cache), exist_ok=True)
+
+        # ---- F2：真 fastresume 文件 → remove_task(delete_files=False) → 回收
+        rp = os.path.join(resume_dir(cache), f"{IH}.fastresume")
+        with open(rp, "wb") as f:
+            f.write(b"d4:infod4:name4:demoee")
+        add_rec(reg, IH, download=True, save_path=os.path.join(dl, IH),
+                result="R")
+        reg.tasks[IH] = {"info_hash": IH, "save_path": os.path.join(dl, IH)}
+        ck.check(os.path.isfile(rp), "前置：fastresume 已落盘（真 tempfile 目录）")
+        ck.check(ops.remove_task(IH, delete_files=False) is True,
+                 "remove_task(delete_files=False) 成功")
+        ck.check(not os.path.exists(rp),
+                 "F2：删任务后孤儿 fastresume 被回收（不再泄漏）")
+
+        # ---- F2 负例：注册表仍有同 key 记录 → 绝不误删其续传数据
+        rp2 = os.path.join(resume_dir(cache), f"{IH2}.fastresume")
+        with open(rp2, "wb") as f:
+            f.write(b"d4:infod4:name4:liveee")
+        add_rec(reg, IH2, download=True, save_path=os.path.join(dl, IH2))
+        ops._delete_orphan_resume(IH2)
+        ck.check(os.path.isfile(rp2),
+                 "F2：同 key 记录仍在 → 保留 fastresume（不误删活任务续传）")
+        # 非法键（临时键 tmp-<id>）：不拼 resume 路径（ValueError 防线）
+        ops._delete_orphan_resume("tmp-123456")
+        ck.check(True, "F2：临时键安全跳过（resume_path 不因非法 ih 掀翻）")
+
+        # ---- F3：D9 守卫拒删（目录名 != 任务键）后空目录被 rmdir 收尾
+        k = "5" * 40
+        d = os.path.join(dl, "MyDir")      # save_subdir 语义：目录名 != 任务键
+        os.makedirs(d, exist_ok=True)
+        add_rec(reg, k, download=True, save_path=d)
+        reg.tasks[k] = {"info_hash": k, "save_path": d}
+        ck.check(ops.remove_task(k, delete_files=True) is True,
+                 "remove_task(delete_files=True) 成功")
+        ck.check(not os.path.isdir(d),
+                 "F3：拒删分支里空目录被 rmdir 收尾（不留残留空目录）")
+
+        # ---- F3：拒删分支 + 非空目录（含用户文件）→ 原样保留（守卫不放宽）
+        k2 = "6" * 40
+        d2 = os.path.join(dl, "MyDirShared")
+        os.makedirs(d2, exist_ok=True)
+        with open(os.path.join(d2, "user.bin"), "wb") as f:
+            f.write(b"keep-me")            # 共享目录里的非种子用户文件
+        add_rec(reg, k2, download=True, save_path=d2)
+        reg.tasks[k2] = {"info_hash": k2, "save_path": d2}
+        ops.remove_task(k2, delete_files=True)
+        ck.check(os.path.isdir(d2)
+                 and os.path.isfile(os.path.join(d2, "user.bin")),
+                 "F3：非空目录原样保留（守卫保护共享目录用户文件）")
+        shutil.rmtree(d2, ignore_errors=True)
+
+        # ---- F2+F3 复合：键名合法 → fastresume 回收与目录收尾互不影响
+        ck.check(resume_path(cache, IH).endswith(f"{IH}.fastresume"),
+                 "resume_path 复用 core.resume 既有函数（未拼字符串）")
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+
 def main() -> int:
     ck = ts.Checker("taskops_test（阶段 4 任务 CRUD 专项）")
     ck.section("core/taskops.py 专项验收（假句柄 + 真注册表，不联网）")
@@ -548,6 +878,9 @@ def main() -> int:
     section_focus(ck)
     section_tasks(ck)
     section_facade(ck)
+    section_remove_wrapup(ck)
+    section_lifecycle(ck)
+    section_promote_cross_restart(ck)
     return ck.report()
 
 

@@ -8,7 +8,7 @@
 - **文件树视图**：目录层级、单文件大小、占比，双击媒体文件直接预览。
 - **视频边下边播**：libtorrent 单文件锁定 + 分块顺序下载 + 索引块（moov）优先 → 本地 HTTP 流服务（仅监听 127.0.0.1，支持 Range）→ 内嵌 QMediaPlayer 播放，实时显示缓冲进度。播放器请求未就绪区间时自动「点播」调度器补拉并等待（moov 探测与任意拖动均可正常工作）。
 - **图片画廊**：图片文件按需下载到临时缓存，完成后自动载入缩略图，支持 Ctrl+滚轮缩放、翻页；画廊内切换未下载图片会自动切换下载目标。
-- **设置**（右上角「设置」按钮）：SOCKS5/HTTP 代理（含账号密码、Peer 连接走代理以保护 IP）、元数据获取超时、**下载限速**（KB/s，会话级热更新）、**预览缓存上限**（超限按最久未活跃顺序自动清理旧预览数据，已下载文件不受影响）、**运行日志开关**、缓存目录、退出时清理缓存、立即清理缓存。代理、超时、限速与日志开关保存后立即生效（libtorrent `apply_settings` 热更新），缓存目录与并发数修改重启生效，缓存上限在下次切换预览文件时生效。设置持久化于 QSettings（Windows 注册表 `HKEY_CURRENT_USER\Software\Bitseed\MagnetViewer`）。
+- **设置**（右上角「设置」按钮）：SOCKS5/HTTP 代理（含账号密码、Peer 连接走代理以保护 IP）、元数据获取超时、**下载限速**（KB/s，会话级热更新）、**预览缓存上限**（超限按最久未活跃顺序自动清理旧预览数据，已下载文件不受影响）、**预览缓存模式**（convert=关闭预览后继续缓存为持久任务（迅雷式，推荐）/ hold=关闭预览即暂停冻结）、**运行日志开关**、缓存目录、退出时清理缓存、立即清理缓存。代理、超时、限速与日志开关保存后立即生效（libtorrent `apply_settings` 热更新），缓存目录与并发数修改重启生效，缓存上限在下次切换预览文件时生效，预览缓存模式在下次关闭预览时生效。设置持久化于 QSettings（Windows 注册表 `HKEY_CURRENT_USER\Software\Bitseed\MagnetViewer`）。
 - **拖放与输入历史**：可直接把 `.torrent` 文件或磁力链文本拖入窗口（落点即解析）；输入框带自动补全，保留最近 15 条解析记录（置顶去重，持久化到 QSettings）。
 - **暗色主题与缓冲可视化**：全局暗色界面（集中式主题，`ui/theme.py`）；播放进度条按分块落盘位图**分段着色**已缓存区域，拖动过程中即预取目标区间（不等松手），跳转后缓冲栏明确提示「跳转中，正在缓冲目标位置」。
 - 预览可随时取消（自动释放下载配额）。
@@ -128,16 +128,21 @@ magnet-viewer/
 │   ├── models.py         # 数据模型
 │   └── config.py         # QSettings 持久化 + 代理/历史映射
 ├── ui/
-│   ├── main_window.py    # 主窗口与线程桥接（含拖放与输入历史）
+│   ├── theme.py          # 设计系统单一来源：语义色/间距/圆角/字号 token + 全局 QSS（唯一允许写色值的文件）
+│   ├── main_window.py    # 主窗口与线程桥接（含拖放与输入历史、关窗遮罩）
 │   ├── file_tree.py      # 文件树
 │   ├── preview_pane.py   # 预览容器（播放器/画廊切换）
 │   ├── preview_player.py # 内嵌视频播放器
 │   ├── gallery.py        # 图片画廊
+│   ├── downloads_pane.py # 下载管理页（任务列表 + 详情）
 │   ├── status_panel.py   # 状态面板
-│   └── settings_dialog.py# 设置对话框（代理 / 超时 / 缓存）
+│   ├── settings_dialog.py# 设置对话框（代理 / 超时 / 缓存）
+│   └── add_download_dialog.py # 添加下载对话框
 ├── REVIEW.md             # 上一轮全面审查报告（含修复记录）
 ├── audit_report.md       # 本轮团队全面审查报告与修复进度
 ├── contract_check.py     # 对外契约自检（秒级，重构 fetcher 的安全网）
+├── theme_check.py        # 主题门禁：色值/内联样式只允许出现在 ui/theme.py（秒级）
+├── ui_shot.py            # UI 截图工具（offscreen 四张 PNG，改造前后人工对照）
 ├── persist_test.py       # 持久化专项（假依赖，秒级）
 ├── session_test.py       # 会话核心专项（假依赖，秒级）
 ├── registry_test.py      # 注册表与锁归属专项（含 R-1 锁探针，秒级）
@@ -145,7 +150,7 @@ magnet-viewer/
 ├── resolver_test.py      # 解析与元数据编排专项（假会话，秒级）
 ├── preview_test.py       # 预览桥与状态专项（假句柄，秒级）
 ├── hybrid_v2_test.py     # 入口矩阵混合 v2 列（两入口端到端）
-├── regression_run.py     # 一键回归（16 套）
+├── regression_run.py     # 一键回归（20 套）
 ├── magnet-viewer.spec    # PyInstaller 打包配置（onedir，产物 dist/MagnetViewer/）
 ├── build.bat             # 一键打包（清旧产物 → 构建 → pack_check 自检）
 ├── pack_check.py         # 打包产物自检（必需组件 / 瘦身是否失效 / 体积哨兵）
@@ -159,11 +164,31 @@ magnet-viewer/
 └── start.bat             # 一键启动
 ```
 
+## UI 设计约定（阶段 B：设计系统 v2）
+
+界面只有**一处**风格来源：`ui/theme.py`。约定由机器门禁 `theme_check.py` 强制，违反即回归红。
+
+1. **色值只在 `ui/theme.py`**：`ui/*.py`（除 theme.py）出现任何 hex 字面量（`#rgb` / `#rrggbb` / `#rrggbbaa`）都会被 `theme_check.py` 判红。需要新颜色 → 在 theme.py 加语义色 token，别在控件里写色。
+2. **局部样式走 `setObjectName` + QSS**：`ui/*.py`（除 theme.py）禁止调用 `setStyleSheet`（theme.py 的 `apply_theme` 是唯一入口）。控件上加 `widget.setObjectName("xxx")`，再到 theme.py 的 QSS 里写 `#xxx` 规则。
+3. **状态差异用动态属性**：同一控件的不同状态（如播放器标题正常/错误）用属性选择器——
+   `self.title.setProperty("error", True)` + QSS `QLabel#playerTitle[error="true"]`。
+   Qt 不会自动重算样式：改属性后必须 `style().unpolish(w)` + `style().polish(w)`（见 `ui/preview_player.py:_set_title_error`）。
+4. **token 词汇**（间距 8px 网格，圆角 8/12，正文 13px / 次级 12px / 标题 15px）：
+   - 色：`BG` `BG_PANEL` `BG_INPUT` `BG_HOVER` `BORDER` `TEXT` `TEXT_MUTED` `TEXT_DIM` `ACCENT` `OK` `WARN` `DANGER`
+   - 间距：`SP_XS/SM/MD/LG/XL` = 4/8/12/16/24；圆角：`R_SM/MD/LG` = 6/8/12；字号：`FS_CAPTION/FS_BODY/FS_TITLE/FS_DISPLAY`
+   - 命名控件：`#topBar` `#urlInput` `#primary` `#ghost` `#playButton` `#card` `#sectionTitle` `#fieldNote` `#hint` `#metaLabel` `#emptyHint` `#thumbList` `#imageViewer` `#playerTitle`（+ `[error="true"]`）`#statusBar` `#fileTree` `#taskList` `#bufferBar` `#shutdownOverlay` `#shutdownLabel` `#shutdownBar`
+5. **自检与对照**：
+   - `.venv/Scripts/python theme_check.py` → `=== 主题门禁：OK ===`（退出码 0 通过 / 1 违规 / 2 环境异常）
+   - `.venv/Scripts/python ui_shot.py [输出目录]` → offscreen 产出 `01-empty / 02-files / 03-preview / 04-downloads` 四张 PNG（默认 `.hermes/shots/`），用于"改造前 / 改造后"人工对照
+
 ## 验证状态
 
 | 验证项 | 结果 |
 |--------|------|
-| `contract_check.py`：对外契约自检（23 个公开接口签名 / 3 个属性 / 9 项实例兼容属性 / models·parser·scheduler·stream_server·cache_guard·cache_quota·persist·session·registry·taskops·resolver·preview 签名 / states·registry 常量取值 / TaskRecord 字段集 / fetcher 别名全 property 结构 / R-4 UI 无私有直写 / CACHE_MARKER 常量）—— **157 项通过** | 通过（秒级，不启会话） |
+| `contract_check.py`：对外契约自检（23 个公开接口签名 / 3 个属性 / 9 项实例兼容属性 / models·parser·scheduler·stream_server·cache_guard·cache_quota·persist·session·registry·taskops·resolver·preview 签名 / states·registry 常量取值 / TaskRecord 字段集 / fetcher 别名全 property 结构 / R-4 UI 无私有直写 / CACHE_MARKER 常量）—— **169 项通过** | 通过（秒级，不启会话） |
+| `theme_check.py`：**主题门禁**（R1 `ui/*.py`（除 theme.py）零 hex 色值 / R2 零 `setStyleSheet` 调用 / R3 theme.py 导出约定 token 与非空 QSS） | 通过（5 项，秒级；故意破坏时退出码 1） |
+| `close_lag_test.py`：**关窗异步化与硬超时**（实测 51 项 0 FAIL）——首次 `close()` <200ms 且窗口仍可见 / 遮罩可见 / 后台收尾各一次且 **C1 快照确取自 shutdown 之前**（关前登记活任务目录 + 替身 shutdown 复刻「清空注册表」，事后取必空）/ **硬超时自动触发**（`SHUTDOWN_HARD_TIMEOUT_MS` 实例覆盖 300ms，仅驱动事件循环即关窗）/ 停机窗口内 **22 个入口与桥回调全部守卫早退**（含源码 AST 清点表）/ **遮罩像素级绘制断言**（采样点 RGB 20,22,26→12,14,18）+ 随 resize 跟动 / `closeEvent` 逆常回退（遮罩/线程抛异常仍能关窗）/ 窗口期内重复关闭幂等 | 通过（约 6s，offscreen；7 项关键实现各做过「先红」反向验证） |
+| `ui_shot.py`：UI 截图工具（offscreen，四张 PNG 供改造前后人工对照） | 通过（01-empty / 02-files / 03-preview / 04-downloads） |
 | `persist_test.py`：**第一阶段持久化专项**（假依赖，不启会话/不联网）——纯函数路径卫生、任务清单原子写与失败不扩散、fastresume 请求/归属、退出清理（有界等待·幂等重发·临时键 tmp-<id> 不再掀翻 drain）、启动恢复九组（无 resume / resume 有效 / resume 损坏 / .torrent / 来源失效 / add 失败 / 暂停·停止·完成 / 元数据就绪 / 目录冲突）、Facade 委托接线 —— **91 项通过** | 通过（1.6s） |
 | `session_test.py`：第二阶段会话核心专项（假依赖）——会话配置纯函数 / start 端口冲突回退与恢复异常不阻断 / 代理限速热更新 / shutdown 四步（remove_torrent(handle,0) 绝不删用户数据·有界 join·drain 恰一次）/ 五类告警分发 / per-task 看门狗（记录级超时·四态过滤·文案取数 D5）/ sweep 节流 / alert 循环整批韧性 / Facade 真接线 —— **78 项通过** | 通过（0.7s） |
 | `registry_test.py`：第三阶段注册表与锁归属专项——hash_key/ih_from_params 纯函数 / put_record 让位与别名 / 焦点换代 / find_record 双重匹配 / detach 三件套 / **R-1 锁探针（try-acquire + property spy + 4 线程×500 轮并发；_emit_error 端到端）** / preview_dir / Facade property 单源 —— **47 项通过** | 通过（0.3s） |
@@ -175,7 +200,7 @@ magnet-viewer/
 | `moov_stream_test.py`（ffprobe/ffmpeg 实测，需 imageio-ffmpeg，缺失时退出码 2=SKIP） | 通过：A 仅头部→打不开（复现 moov not found）；B 头+尾+**按需补拉**→可探测；C 全量→可探测 |
 | `qt_stream_open_test.py`（QMediaPlayer FFmpeg 后端 offscreen 实测，依赖同上） | 通过：A 仅头部→`FormatError`（即用户遇到的 moov atom not found）；B 头+尾+按需补拉→`LoadedMedia` 成功开播；C 全量→成功 |
 | GUI 无头启动 | 通过（主窗口构造、会话与流服务启动、退出码 0） |
-| `gui_feature_test.py`（offscreen 实测 70 项） | 通过：主窗口实例化 / **设置接线（默认下载目录·并发数生效、流服务多根）** / 拖放接受·拒绝 / 输入历史（置顶去重、上限 15、持久化读回、**测试后恢复不污染用户注册表**）/ 文件树（嵌套目录三级展开、无折叠、无 `.pad`、叶子数与可见文件数一致）/ **磁盘路径映射键为绝对路径且可命中** / **清理缓存保留名单（downloads/.tasks.json/.resume 不误删）** / **画廊按 save_subdir 隔离路径加载大图** / **评审 P0 防回归（添加下载对话框 priority() 可调用 · 下载页 700ms 刷新后选中与详情保持）** / **播放器 seek 防抖·预取·缓冲分段着色** |
+| `gui_feature_test.py`（offscreen 实测 126 项） | 通过：主窗口实例化 / **设置接线（默认下载目录·并发数生效、流服务多根）** / 拖放接受·拒绝 / 输入历史（置顶去重、上限 15、持久化读回、**测试后恢复不污染用户注册表**）/ 文件树（嵌套目录三级展开、无折叠、无 `.pad`、叶子数与可见文件数一致）/ **磁盘路径映射键为绝对路径且可命中** / **清理缓存保留名单（downloads/.tasks.json/.resume 不误删）** / **画廊按 save_subdir 隔离路径加载大图** / **评审 P0 防回归（添加下载对话框 priority() 可调用 · 下载页 700ms 刷新后选中与详情保持）** / **播放器 seek 防抖·预取·缓冲分段着色** |
 | `single_file_test.py`：单文件种子 × 本地种子/磁力链两条入口 | 通过（12/12）：路径层级、`file_disk_path` 落点、流服务按 `f.path` 供给 206（目录隔离后断言随 `.preview/<ih>/` 布局更新，接口未变） |
 | `local_torrent_test.py`：本地 .torrent 闭环 | 通过（9/9）：`cache_dir` 注入、路径映射键为绝对路径、流服务联动返回字节与磁盘一致（同上随布局更新） |
 | `hybrid_v2_test.py`：**入口矩阵混合 v2 列补齐**（P0-2/P1-1 防回归）：默认产种（meta version=2）× 本地 .torrent / 磁力链两条入口 | 通过（19/19）：造种自检 parser hash==lt.info_hash()（SHA-256 截断 20 字节）、两入口 info_hash 与造种端一致、多文件层级 root/inner、预览下载完成、流服务 206、纯 v2 明确 ValueError（剥 files 键构造）|
@@ -183,8 +208,8 @@ magnet-viewer/
 | `live_test.py`：公网 DHT | **沙箱内不可用** —— 该环境仅允许 HTTP(S) 走代理，BT/UDP 出站被屏蔽（`dht_nodes` 恒为 0）。请在正常 BT 网络下执行 `python live_test.py` 复核。 |
 
 > 测试退出码约定：`0`=通过，`1`=失败，`2`=SKIP（依赖缺失时显式跳过，绝不假装通过）。
-> 一键回归：`python regression_run.py`（16 套：`contract_check` 契约自检 + 6 套重构专项（persist/session/registry/taskops/resolver/preview，假依赖秒级）+ 8 套旧测试（含混合 v2 入口矩阵）+ 下载管理模块验收；也可 `python regression_run.py smoke` 按名字前缀单跑）。
-> 覆盖率报告：`python coverage_run.py`（快速集，秒级）/ `coverage_run.py full`（全量 16 套）——coverage.py 接入，只报告不设门禁；基线（2026-09-07 快速集）：registry 97% / preview 94% / session 95% / persist 90% / resolver 88% / fetcher 85%。
+> 一键回归：`python regression_run.py`（20 套：`contract_check` 契约自检 + `theme_check` 主题门禁 + 6 套重构专项（persist/session/registry/taskops/resolver/preview，假依赖秒级）+ `close_lag_test` 关窗异步化 + 9 套旧测试（含混合 v2 入口矩阵）+ 下载管理模块验收；也可 `python regression_run.py smoke` 按名字前缀单跑）。
+> 覆盖率报告：`python coverage_run.py`（快速集，秒级）/ `coverage_run.py full`（全量 20 套）——coverage.py 接入，只报告不设门禁；基线（2026-09-07 快速集）：registry 97% / preview 94% / session 95% / persist 90% / resolver 88% / fetcher 85%。
 > 测试覆盖策略：按**数据入口路径**（本地种子 / 磁力链；单文件 / 多文件 / 混合 v2）铺排，而非仅按功能模块——历史上三个缺陷都源于同一功能的不同入口未各自覆盖。详见 `REVIEW.md`。
 
 ## 已修复问题
@@ -210,8 +235,44 @@ magnet-viewer/
 
 > 注意：libtorrent 2.1.x 已移除 `settings_pack`，改用 `lt.session(dict)` 配置（本项目已适配，2.0.x 同样兼容）。磁力链元数据依赖 `metadata_received_alert`，本项目显式设置了 `alert_mask` 订阅必要告警类别，并做到「单条告警处理异常不中断整批处理」。
 
+## 大块种子的播放行为（已知取舍）
+
+> 缘起：真机实测 **4.1GB / 4MB 块**的 mp4 —— 缓冲恒 0.0%、30s 不出画面。根因是调度
+> 窗口按「**块数**」定、与块尺寸脱钩：`LOOKAHEAD_PIECES=60` 在 4MB 块下等价于
+> **240MB 全 ASAP**，libtorrent 在几十个同级「紧急」块里按可用性散抓，文件头迟迟凑不出
+> 连续前缀。（详见 `plan/07_large_piece_playback_plan.md`。）
+
+当前行为（plan/07 四阶段已落地）：
+
+- **播放窗口按字节预算**：窗口块数 = `clamp(ceil(16MB ÷ 块长), 4, 60)`，窗口内按播放
+  位置**递增 deadline**（第 i 块 = `i × 400ms`）**顺序**取块 —— 保证从播放位置起的连续
+  前缀先到齐，不再全 0 洪泛。
+- **尾窗按字节收敛**：尾部索引窗口 = `min(size, max(2MB, 0.25%·size), 16MB)` —— 4.1GB
+  从旧式的 44MB（11 块）收敛到 ≈10MB（3 块），且 deadline 排在播放窗口之后。
+- **开播只需两块**：门控 = 「文件**头第 1 块**就绪」且「**尾部入口**（文件最后
+  `min(2MB, size)` 字节覆盖的块）就绪」。入口块的 deadline 提前到头窗头几块并行，无需
+  等整个尾部窗口就绪；moov 在尾部的普通 MP4 因此能提前开播（真机 4.1GB 几何门控成立
+  36.0s → 10.0s，详见 plan）。
+- **状态栏「缓存」口径 = 已下载字节**（`file_progress` 汇总），不再用 `.preview` 目录的
+  **预分配尺寸** —— 4.1GB 稀疏文件不会再一上来就显示「缓存 4.1GB」（旧口径恒等于文件
+  大小，让人误以为缓存爆了）。**配额判定（LRU 清理）仍按目录占用**统计，两套口径不同、
+  不互换。
+
+**已知问题（暂未修）**：客户端开启**下载限速**（`local_download_rate_limit`）遇上 4MB
+大块时**可能硬停滞** —— 实测限速 8MB/s 下，300MB 种子下到约 **25MB 后双方静默、无任何
+告警**（长时间不再增长）；同一试验**关闭限速则 4 秒下完**（26–44MB/s）。这属于
+libtorrent 限速器与本地大块通道的交互问题、不在应用层可控范围，故未修复。**若遇到
+「越下越慢、最后不动」，优先在「设置」中临时关闭客户端限速。**
+
 ## 已知限制（如实说明）
 
+- **关窗收尾与硬超时**：关闭窗口后收尾跑在后台线程（会话停机 2s join + 最多 3s
+  fastresume drain + 会话析构 + 停流服务 ≈0.5s，实测合计约 3.8s），界面显示
+  「正在保存并退出」遮罩、不会假死；但 **10 秒硬超时**到点会强制关窗并结束进程
+  ——此时后台收尾线程（daemon）可能被**中途结束**，最新一次续传状态
+  （fastresume）可能来不及落盘，下次启动会按更早的 `.resume` 续传或对未确认分块
+  重新校验。退出时清理预览缓存本身很快（实测 200MB 的 rmtree 约 15ms），**不是**
+  收尾耗时的主因。
 - **冷门资源**：磁力链必须存在在线 Peer 才能拿到元数据；0 做种资源会超时（默认 90 秒）。这是协议本质限制。
 - **种子版本**：支持 v1 与 v1+v2 混合种子（BEP-52），info_hash 分别按 SHA-1 / SHA-256 计算。**纯 v2 种子**（仅含 `file tree`）暂不支持，解析时会给出明确提示。
 - **纯函数单元测试**：六个重构专项（persist/session/registry/taskops/resolver/preview，共 367 项）以假依赖覆盖纯函数与分支路径，不启会话、秒级完成；混合 v2 × 两条入口的端到端矩阵仍待补（见 REVIEW.md §四）。

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from typing import Callable, Iterable
 
 from core.logutil import log_warning
 
@@ -42,6 +43,32 @@ def dir_size_bytes(path: str) -> int:
                     pass
     except OSError:
         pass
+    return total
+
+
+def downloaded_bytes(file_progress) -> int:
+    """已下载字节汇总（plan/07 阶段 3 的**显示**口径）。
+
+    ``handle.file_progress()`` 是每文件的已下载字节数组（核心指标，已在
+    ``background_cache_text`` / 状态快照多处使用）。此前状态栏「缓存占用」
+    走 ``dir_size_bytes(.preview)``——统计的是**预分配尺寸**：稀疏文件预分配
+    后目录逻辑大小恒等于文件大小，4.1GB 的种子才下 59MB 就显示「缓存
+    4.1 GB / 2.0 GB」，既误导又像爆缓存。改用已下载字节后显示真实进度。
+
+    **只服务显示**：预览缓存上限判定仍走 ``dir_size_bytes``（它管磁盘占用，
+    需保守），二者口径不同、不可互换。
+
+    容错：``None`` / 非法项按 0 计、负值截 0（不产生负数占用）；纯函数，
+    不碰文件系统，便于单测（contract_check 冻结）。
+    """
+    total = 0
+    for v in (file_progress or ()):
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            total += n
     return total
 
 
@@ -78,16 +105,41 @@ def scan_preview_dirs(preview_root: str) -> list[tuple[str, int, float]]:
     return out
 
 
-def enforce_preview_limit(preview_root: str, limit_mb: int,
-                          keep_dirs: set[str] | None = None,
-                          warn=None) -> tuple[int, int]:
+def _norm_keep(
+        keep_dirs: "set[str] | Iterable[str] | Callable[[], set[str] | Iterable[str]] | None"
+        ) -> set[str] | None:
+    """keep_dirs 归一：set/None 直取，callable 现取快照（C2）。
+
+    回调抛异常返回 None——调用方按「名单故障」保守处理（本轮不删）。
+    D5-B 措辞诚实化：现网唯一名单来源 registry.protected_dirs 是锁内纯
+    dict 遍历，实际不抛异常；异常上抛透传到 None 分支只是最后防线。主要
+    故障模式是**空注册表竞态**（会话未起/已停机），该场景正常返回空集，
+    维持「无保护目录可删」的现状语义——空集不当可疑处理。
+    """
+    try:
+        kd = keep_dirs() if callable(keep_dirs) else keep_dirs
+    except Exception:
+        return None
+    return {os.path.normcase(os.path.abspath(d))
+            for d in (kd or set()) if d}
+
+
+def enforce_preview_limit(
+        preview_root: str, limit_mb: int,
+        keep_dirs: "set[str] | Iterable[str] | Callable[[], set[str] | Iterable[str]] | None" = None,
+        warn=None) -> tuple[int, int]:
     """执行配额：超限时按 LRU 删除最旧的任务目录。
 
     返回 ``(清理后总占用字节, 本次释放字节)``。
     ``limit_mb <= 0`` 视为不限制，只统计不删除。
+
+    ``keep_dirs`` 接受**集合或零参回调**（阶段 C C2）：回调形态下入口取
+    一次快照、**每个候选目录 rmtree 前再取一次**复核——堵住「取名单 →
+    扫描 → 执行删除」窗口内新登记目录（刚开的 review / 刚转正的任务）
+    被陈旧快照误删的竞态。回调抛异常 = 名单故障 → 本轮保守不删。
+    集合形态行为与基线逐字一致（无逐项复核开销）。
     """
-    keep = {os.path.normcase(os.path.abspath(d))
-            for d in (keep_dirs or set()) if d}
+    keep = _norm_keep(keep_dirs)
     items = scan_preview_dirs(preview_root)
     total = sum(size for _p, size, _t in items)
 
@@ -97,6 +149,9 @@ def enforce_preview_limit(preview_root: str, limit_mb: int,
         except Exception:
             pass
 
+    if keep is None:
+        _warn("保护名单取用失败：本轮跳过配额删除（保守）")
+        return total, 0
     if limit_mb <= 0:
         return total, 0
     limit = int(limit_mb) * 1024 * 1024
@@ -108,8 +163,18 @@ def enforce_preview_limit(preview_root: str, limit_mb: int,
     for path, size, _t in sorted(items, key=lambda x: (x[2], x[0])):
         if total - freed <= limit:
             break
-        if os.path.normcase(os.path.abspath(path)) in keep:
+        norm = os.path.normcase(os.path.abspath(path))
+        if norm in keep:
             continue
+        if callable(keep_dirs):
+            # C2：删除动作与入口快照之间可插入新 review——rmtree 前复核
+            fresh = _norm_keep(keep_dirs)
+            if fresh is None:
+                _warn("保护名单取用失败：中止本轮剩余删除（保守）")
+                break
+            keep = fresh
+            if norm in keep:
+                continue
         try:
             shutil.rmtree(path, ignore_errors=True)
         except Exception as e:

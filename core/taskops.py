@@ -33,8 +33,10 @@ import libtorrent as lt
 from .logutil import log_warning
 from .models import ParseResult
 from .parser import is_torrent_path, parse_torrent_file
-from .persist import TaskPersistence, is_within, save_subdir_of, task_dir
+from .persist import (TaskPersistence, is_resume_key, is_within,
+                      save_subdir_of, task_dir)
 from .registry import (TaskRecord, TaskRegistry, hash_key, ih_from_params)
+from .resume import resume_path
 from .states import (BOOTSTRAP_TRACKERS, STATE_COMPLETED, STATE_DOWNLOADING,
                      STATE_META_FETCH, STATE_PAUSED, STATE_QUEUED,
                      STATE_STOPPED, STATE_VALIDATE)
@@ -214,11 +216,18 @@ class TaskOps:
 
     def _convert_to_download_locked(self, rec: TaskRecord, ih: str,
                                     source: str, save_subdir: str | None,
-                                    priority: int, seed: bool) -> str:
+                                    priority: int, seed: bool,
+                                    selected_files: list[str] | None = None) -> str:
         """预览/查看态记录转正为下载任务（D10）。
 
         沿用既有句柄与落盘目录（.preview/<ih>，已下载分块零额外下载），
         仅解除 upload_mode 并开始按文件优先级下载；调用方须已持锁。
+
+        ``selected_files``（阶段 B 审查 Critical-1）：转正清单的 selected
+        集合。convert 档关预览转正的是「继续缓存正在预览的那一个文件」，
+        调用方须把预览文件路径传进来——缺省 None = 全视图文件（add_task
+        入口的种子级全选语义保持现状）。不写对，resume/重启走
+        activate_download 就会按 selected 把清单刷成全选。
         """
         reg = self.reg
         rec.download = True
@@ -233,16 +242,25 @@ class TaskOps:
             task = task_from_result(rec.result, state=STATE_DOWNLOADING,
                                     save_path=rec.save_path,
                                     priority=rec.priority,
-                                    source=source, seed=seed)
+                                    source=source, seed=seed,
+                                    selected=selected_files)
             reg.tasks, _ = upsert_task(reg.tasks, task)
         else:
             rec.state = STATE_META_FETCH
             if not rec.resolving:
                 rec.resolving = True
                 rec.resolve_started = time.time()
+            # selected=[] 在 activate_download 语义中 = 全选（判式
+            # `not selected or f.path in selected`）；元数据到达后
+            # on_metadata_received 会按 view_files 回填。已知限制：本分支
+            # 只被 add_task 种子级转正打到（全选语义，与其清单一致）；
+            # convert 档关预览转正走不到这里——其快照条件要求
+            # rec.result is not None，元数据未就绪只 release 不转正。
             task = {"info_hash": ih, "source": source,
                     "name": "(获取元数据中)", "total_size": 0,
-                    "files": [], "selected": [],
+                    "files": [],
+                    "selected": (list(selected_files)
+                                 if selected_files else []),
                     "state": STATE_META_FETCH,
                     "priority": rec.priority,
                     "save_path": rec.save_path, "error": "", "retries": 0,
@@ -254,18 +272,25 @@ class TaskOps:
         # 失败语义不变（两者内部均仅告警）。
         return ih
 
-    def activate_download(self, rec: TaskRecord) -> None:
-        """让下载任务真正开始：解除 upload_mode、按所选文件设优先级、resume。
+    def activate_download(self, rec: TaskRecord,
+                          preserve_files: bool = False) -> None:
+        """让下载任务真正开始：解除 upload_mode、resume（可选重设文件优先级）。
 
         预览任务（scheduler.begin）不在此列：它独立 unset auto_managed +
         手动 resume，保证不被 active_downloads 队列饿死（沿用既有做法）。
+
+        ``preserve_files=True``（阶段 B convert 转正）：跳过按任务清单
+        "selected" 重设文件优先级——预览态 begin() 已把目标文件置 4、其余
+        置 0，转正要延续的正是在下那些块。且 libtorrent 对 upload_mode
+        句柄的 prioritize_files 会被丢弃，这里必须**先解除 upload_mode
+        再置 auto_managed 最后 resume**，优先级才真正保留。
         """
         if rec.handle is None:
             return
         try:
             rec.handle.unset_flags(lt.torrent_flags.upload_mode)
             rec.handle.set_flags(lt.torrent_flags.auto_managed)
-            if rec.result is not None:
+            if rec.result is not None and not preserve_files:
                 ti = rec.handle.torrent_file()
                 if ti is not None:
                     ih = hash_key(rec.handle)
@@ -372,6 +397,8 @@ class TaskOps:
         唯一允许真正移除句柄的入口；``delete_files=True`` 时删除任务落盘
         目录——只允许删除受管范围（cache_dir 或本会话下载根内）且目录名
         与任务键一致的目录（D9：删文件经守卫，防误删用户数据）。
+        成功注销后一并回收该任务的孤儿 fastresume（F2，见
+        ``_delete_orphan_resume``）。
         """
         key = (task_id or "").strip().lower()
         save_path = None
@@ -411,7 +438,32 @@ class TaskOps:
         self.persist.persist_tasks()
         if delete_files and save_path:
             self.delete_task_files(key, save_path)
+        # F2：孤儿 fastresume 回收（成功注销/清清单后，注册表再无同 key 记录）
+        self._delete_orphan_resume(key)
         return True
+
+    def _delete_orphan_resume(self, key: str) -> None:
+        """删任务后回收孤儿 fastresume：``<cache_dir>/.resume/<key>.fastresume``。
+
+        fastresume 与注册表记录同生命周期，而任务删除后残留的文件没有别的
+        清理入口（``clear_cache_contents`` 的 CLEANUP_KEEP 含 ``.resume``，
+        永不参与清理）——不清就是纯泄漏。仅在**注册表已无同 key 记录**时删
+        （读现有锁内查询手法，一次锁段）：同 key 任务若仍在（并发 add 抢回）
+        绝不误删其续传数据。非法键（临时键 ``tmp-<id>``）直接跳过（拼路径会
+        ValueError），失败仅告警。
+        """
+        if not is_resume_key(key):
+            return
+        reg = self.reg
+        with reg.lock:
+            if key in reg.torrents or key in reg.tasks:
+                return   # 同 key 任务仍在：保留其续传数据
+        try:
+            os.remove(resume_path(reg.cache_dir, key))
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log_warning("fetcher.remove_task.resume", f"{e}")
 
     def delete_task_files(self, key: str, path: str) -> None:
         """删除任务落盘目录（受管范围守卫，详见 remove_task docstring）。"""
@@ -429,6 +481,15 @@ class TaskOps:
         else:
             log_warning("fetcher.remove_task.delete",
                         f"拒绝删除非受管任务目录：{ap}")
+            # F3：守卫拒绝后若目录已被 libtorrent（delete_files=True 的
+            # remove_torrent 选项 1）清空，留一个空目录纯属残留——确为空
+            # （os.listdir 为空）才 rmdir 收尾；非空则原样保留（守卫保护
+            # 共享目录里的非种子用户文件，绝不放宽守卫本身）。
+            try:
+                if not os.listdir(ap):
+                    os.rmdir(ap)
+            except OSError as e:
+                log_warning("fetcher.remove_task.delete", f"{e}")
 
     def focus_task(self, task_id: str) -> bool:
         """把某下载任务设为「当前」（状态/预览别名指向它）。

@@ -167,13 +167,57 @@ def main() -> int:
     sig_check("scheduler.tail_piece_window", scheduler, {
         "tail_piece_window": [("file", False), ("piece_length", False)],
     })
+    # plan/07 阶段 1：窗口按字节预算换算（大块种子 240MB 全 ASAP → 16MB 保序）。
+    # 纯函数签名 + 两个新常量按同手法冻结；LOOKAHEAD_PIECES 降级为块数上限但
+    # 取值不变（上面的 preview 绑定断言仍守着 60）。
+    sig_check("scheduler.window_pieces", scheduler, {
+        "window_pieces": [("piece_length", False)],
+    })
+    check(scheduler.LOOKAHEAD_BYTES == 16 * 1024 * 1024,
+          "scheduler.LOOKAHEAD_BYTES == 16MB（plan/07 阶段 1 播放窗口字节预算）")
+    check(scheduler.DEADLINE_STEP_MS == 400,
+          "scheduler.DEADLINE_STEP_MS == 400（窗口内 deadline 递增步长）")
+    check(scheduler.LOOKAHEAD_PIECES == 60
+          and scheduler.window_pieces(16 * 1024) == 60
+          and scheduler.window_pieces(1024 * 1024) == 16
+          and scheduler.window_pieces(4 * 1024 * 1024) == 4
+          and scheduler.window_pieces(8 * 1024 * 1024) == 4,
+          "window_pieces 换算表冻结（16KB→60 上限 / 1MB→16 / 4MB→4 / 8MB→4 下限）")
+    # plan/07 阶段 2：尾窗按字节收敛（大块种子整尾窗 44MB→≈10MB）+ 开播门控
+    # 改判「尾部入口」（最末 2MB 覆盖块）。纯函数签名 + 常量 + 换算表同手法冻结。
+    sig_check("scheduler.tail_window_bytes", scheduler, {
+        "tail_window_bytes": [("size", False)],
+    })
+    sig_check("scheduler.tail_entry_pieces", scheduler, {
+        "tail_entry_pieces": [("file", False), ("piece_length", False)],
+    })
+    check(scheduler.TAIL_BYTES_MIN == 2 * 1024 * 1024
+          and scheduler.TAIL_BYTES_MAX == 16 * 1024 * 1024
+          and scheduler.TAIL_RATIO == 0.0025
+          and scheduler.TAIL_ENTRY_BYTES == 2 * 1024 * 1024
+          and scheduler.TAIL_MAX_PIECES == 128,
+          "阶段 2 尾窗常量冻结（下限 2MB / 上限 16MB / 0.25% / 入口 2MB / 块上限 128）")
+    check(scheduler.tail_window_bytes(500 * 1024 * 1024) == 2 * 1024 * 1024
+          and scheduler.tail_window_bytes(1024 ** 3) == int(1024 ** 3 * 0.0025)
+          and scheduler.tail_window_bytes(int(4.1 * 1024 ** 3))
+          == int(int(4.1 * 1024 ** 3) * 0.0025)
+          and scheduler.tail_window_bytes(100 * 1024) == 100 * 1024
+          and scheduler.tail_window_bytes(100 * 1024 ** 3) == 16 * 1024 * 1024
+          and scheduler.tail_window_bytes(0) == 0,
+          "tail_window_bytes 换算表冻结（4.1GB→0.25%≈10.5MB / 1GB→2.56MB / "
+          "500MB→2MB 下限 / 100KB→自身 / 上限 16MB / size<=0→0）")
     sig_check("PreviewScheduler", scheduler.PreviewScheduler, {
         "begin": [("handle", False), ("file", False)],              # 契约 #5
         "request_range": [("start_byte", False), ("end_byte", False)],
         "seek_to_byte": [("byte_offset", False)],
-        "stop": [],
+        # 阶段 B：stop 新增可选参数 release_only（convert 档只清锚点不
+        # 冻结）。可选参数不破坏既有调用面——默认 False 行为与基线逐字一致。
+        "stop": [("release_only", True)],
         "contiguous_progress": [],
         "tail_ready": [],
+        # plan/07 阶段 2：门控改用的新方法（tail_ready 保留不删，仍供
+        # tick() 判断是否继续补拉整尾窗）。
+        "tail_entry_ready": [],
         "buffer_progress": [],
     })
     sig_check("stream_server", stream_server, {
@@ -280,7 +324,8 @@ def main() -> int:
     # find/piece_map/demand 的 None/False「不可判定」语义是流服务安全前提。
     sig_check("preview.PreviewCore", preview.PreviewCore, {
         "start_preview": [("f", False)],
-        "stop_preview": [],
+        # 阶段 B：可选参数 release_only（convert 档停预览不冻结）
+        "stop_preview": [("release_only", True)],
         "find_record_for_path": [("disk_path", False)],
         "piece_map_for_path": [("disk_path", False)],
         "demand_for_path": [("disk_path", False), ("start_byte", False),
@@ -291,6 +336,11 @@ def main() -> int:
         "current_result": [],
         "status": [],
     })
+    # A1：preview 点播上限复用 scheduler.LOOKAHEAD_PIECES（scheduler 不
+    # import preview，零环保持）——常量绑定关系与取值一并冻结。
+    check(hasattr(preview, "LOOKAHEAD_PIECES")
+          and preview.LOOKAHEAD_PIECES == scheduler.LOOKAHEAD_PIECES == 60,
+          "preview.LOOKAHEAD_PIECES 绑定 scheduler 常量且取值 60（A1）")
     check(all(hasattr(fetcher_mod, n) for n in
               ("STATE_NAMES", "resolver_result_from_ti")),
           "core.fetcher 仍再导出 STATE_NAMES / resolver 纯函数别名")
@@ -303,7 +353,9 @@ def main() -> int:
         "add_task": [("source", False), ("save_subdir", True),
                      ("priority", True), ("seed", True)],
         "task_dir": [("ih", False), ("save_subdir", True)],
-        "activate_download": [("rec", False)],
+        # 阶段 B：preserve_files（convert 转正保留预览 file-priority，
+        # 且解除 upload_mode → auto_managed → resume 的调用顺序是转正生效前提）
+        "activate_download": [("rec", False), ("preserve_files", True)],
         "set_priority": [("task_id", False), ("priority", False)],
         "pause_task": [("task_id", False)],
         "resume_task": [("task_id", False)],
@@ -364,7 +416,16 @@ def main() -> int:
         "scan_preview_dirs": [("preview_root", False)],
         "enforce_preview_limit": [("preview_root", False), ("limit_mb", False),
                                   ("keep_dirs", True), ("warn", True)],
+        # plan/07 阶段 3：缓存**显示**口径改已下载字节（file_progress 汇总），
+        # 纯函数冻结；配额判定仍走 dir_size_bytes（管磁盘占用，二者不互换）。
+        "downloaded_bytes": [("file_progress", False)],
     })
+    check(cache_quota.downloaded_bytes([59 * 1024 * 1024]) == 59 * 1024 * 1024
+          and cache_quota.downloaded_bytes([1, 2, 3]) == 6
+          and cache_quota.downloaded_bytes([]) == 0
+          and cache_quota.downloaded_bytes(None) == 0
+          and cache_quota.downloaded_bytes([-1, 5, None, "x"]) == 5,
+          "downloaded_bytes 口径冻结（汇总/空/None→0、非法与负值容错）")
     check(cache_guard.CACHE_MARKER == ".magnet_viewer_cache",
           "CACHE_MARKER 常量值不变")
 

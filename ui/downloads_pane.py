@@ -19,30 +19,40 @@ from PySide6.QtWidgets import (QApplication, QLabel, QMenu, QMessageBox,
                                QStyledItemDelegate, QStyleOptionProgressBar,
                                QTreeView, QVBoxLayout, QWidget)
 
-from ui.theme import (ACCENT, BG_PANEL, DANGER, OK, TEXT_DIM, TEXT_MUTED)
+import ui.theme as theme          # 状态色在**调用时**读（双主题热切换需跟随）
 from core.models import human_size
 
 COL_NAME, COL_SIZE, COL_PROGRESS, COL_SPEED = 0, 1, 2, 3
 COLUMNS = ["名称", "大小", "进度", "速度·ETA"]
 
-# 状态 -> (emoji, 中文名, 前景色)：⏳白 / ⏸灰 / ✅绿 / ❌红 / 🌱做种蓝
+# 状态 -> (emoji, 中文名, 色板常量名)：⏳白 / ⏸灰 / ✅绿 / ❌红 / 🌱做种蓝。
+# 第三项是 **ui/theme 的常量名**而非色值——色值在绘制/写格时现读
+# （`getattr(theme, ...)`），双主题热切换后任务列表状态色立刻跟随；
+# 若在此固化色值（导入期快照），切到深色板后浅色板配色会残留在表里。
 STATE_META: dict = {
-    "QUEUED":      ("⏳", "排队中", TEXT_MUTED),
-    "META_FETCH":  ("⏳", "获取元数据", TEXT_MUTED),
-    "VALIDATE":    ("⏳", "校验中", TEXT_MUTED),
-    "DOWNLOADING": ("⏬", "下载中", ACCENT),
-    "PAUSED":      ("⏸", "已暂停", TEXT_DIM),
-    "STOPPED":     ("⏹", "已停止", TEXT_DIM),
-    "COMPLETED":   ("✅", "已完成", OK),
-    "SEEDING":     ("🌱", "做种中", ACCENT),
-    "FAILED":      ("❌", "失败", DANGER),
-    "DELETED":     ("🗑️", "已删除", TEXT_MUTED),
+    "QUEUED":      ("⏳", "排队中", "TEXT_MUTED"),
+    "META_FETCH":  ("⏳", "获取元数据", "TEXT_MUTED"),
+    "VALIDATE":    ("⏳", "校验中", "TEXT_MUTED"),
+    "DOWNLOADING": ("⏬", "下载中", "ACCENT"),
+    "PAUSED":      ("⏸️", "已暂停", "TEXT_DIM"),
+    "STOPPED":     ("⏹️", "已停止", "TEXT_DIM"),
+    "COMPLETED":   ("✅", "已完成", "OK"),
+    "SEEDING":     ("🌱", "做种中", "ACCENT"),
+    "FAILED":      ("❌", "失败", "DANGER"),
+    "DELETED":     ("🗑️", "已删除", "TEXT_MUTED"),
 }
-UNKNOWN_STATE = ("⏳", "未知", TEXT_MUTED)
+UNKNOWN_STATE = ("⏳", "未知", "TEXT_MUTED")
+
+
+def _color(const_name: str) -> str:
+    """按常量名现读当前激活色板的色值（切主题后即时生效）。"""
+    return getattr(theme, const_name)
 
 
 def _state_meta(state: str) -> tuple:
-    return STATE_META.get(str(state or "").upper(), UNKNOWN_STATE)
+    emoji, label, const_name = STATE_META.get(str(state or "").upper(),
+                                              UNKNOWN_STATE)
+    return emoji, label, _color(const_name)
 
 
 def _progress_value(task: dict) -> float:
@@ -98,22 +108,25 @@ class ProgressDelegate(QStyledItemDelegate):
         opt.text = f"{value:.0f}%"
         opt.textVisible = True
         opt.state = QStyle.State_Enabled
+        # 选中底色先铺（进度条外边距 6/4 就是留给它的外沿）：必须在 drawControl
+        # **之前**——旧顺序把整块矩形盖在进度条与百分比文字上，选中行看不到进度。
+        if option.state & QStyle.State_Selected:
+            # 选中行底：用**主题色板**的 bg_selected（改造前取 Qt 默认调色板的
+            # highlight，不随深浅主题走，深色下会突兀发蓝）。绘制时现读
+            # ui.theme 模块属性 → 热切换跟随（同 STATE_META 的取色约定）。
+            painter.fillRect(option.rect, QColor(theme.BG_SELECTED))
         pal = QPalette(option.palette)
         if state == "COMPLETED":
-            pal.setBrush(QPalette.Highlight, QColor(OK))
+            pal.setBrush(QPalette.Highlight, QColor(theme.OK))
         elif state in ("PAUSED", "STOPPED"):
-            pal.setBrush(QPalette.Highlight, QColor(TEXT_DIM))
+            pal.setBrush(QPalette.Highlight, QColor(theme.TEXT_DIM))
         elif state == "FAILED":
-            pal.setBrush(QPalette.Highlight, QColor(DANGER))
+            pal.setBrush(QPalette.Highlight, QColor(theme.DANGER))
         else:
-            pal.setBrush(QPalette.Highlight, QColor(ACCENT))
+            pal.setBrush(QPalette.Highlight, QColor(theme.ACCENT))
         opt.palette = pal
         QApplication.style().drawControl(QStyle.CE_ProgressBar, opt, painter,
                                          self.parent())
-        # 聚焦/选中背景仍由默认绘制负责：进度条外沿补绘制选中底色
-        if option.state & QStyle.State_Selected:
-            painter.fillRect(option.rect,
-                             option.palette.highlight().color().lighter(160))
 
 
 class DownloadsPane(QWidget):
@@ -132,6 +145,7 @@ class DownloadsPane(QWidget):
         self._tasks: list[dict] = []
 
         self.tree = QTreeView(self)
+        self.tree.setObjectName("taskList")   # 样式：ui/theme.py QTreeView#taskList
         self._model = QStandardItemModel(0, len(COLUMNS), self)
         self._model.setHorizontalHeaderLabels(COLUMNS)
         self.tree.setModel(self._model)
@@ -148,11 +162,10 @@ class DownloadsPane(QWidget):
         header.setStretchLastSection(True)
 
         self.details = QLabel("（选择任务查看详情）")
+        self.details.setObjectName("metaLabel")   # 样式：ui/theme.py #metaLabel
         self.details.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.details.setWordWrap(True)
         self.details.setMinimumHeight(90)
-        self.details.setStyleSheet(
-            f"color:{TEXT_MUTED}; font-size:12px; background:{BG_PANEL}; padding:6px;")
 
         split = QSplitter(Qt.Vertical, self)
         split.addWidget(self.tree)
@@ -161,12 +174,9 @@ class DownloadsPane(QWidget):
         split.setStretchFactor(1, 1)
         split.setSizes([360, 120])
 
-        self._placeholder = QLabel(
-            "暂无下载任务\n\n点击顶栏「添加下载」、拖入磁力链 / .torrent，\n"
-            "或在文件树右键「添加下载」开始管理下载任务")
+        self._placeholder = QLabel("暂无下载任务 —— 解析后右键文件可「添加下载」")
+        self._placeholder.setObjectName("emptyHint")   # 样式：#emptyHint
         self._placeholder.setAlignment(Qt.AlignCenter)
-        self._placeholder.setStyleSheet(
-            f"color:{TEXT_MUTED}; font-size:12px; line-height:1.6;")
 
         self._stack = QStackedWidget(self)
         self._stack.addWidget(self._placeholder)   # 0：空态引导
@@ -276,7 +286,7 @@ class DownloadsPane(QWidget):
         state = str(task.get("state", "")).upper()
 
         menu = QMenu(self)
-        act_pause = menu.addAction("⏸ 暂停")
+        act_pause = menu.addAction("⏸️ 暂停")
         act_resume = menu.addAction("▶ 恢复")
         menu.addSeparator()
         act_prio_up = menu.addAction("优先级 ↑")

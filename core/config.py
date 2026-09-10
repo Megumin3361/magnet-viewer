@@ -7,6 +7,7 @@ import os
 from PySide6.QtCore import QSettings
 
 from core import secretbox
+from core.cache_mode import PREVIEW_CACHE_CONVERT
 
 RECENT_LIMIT = 15
 
@@ -25,7 +26,13 @@ DEFAULTS: dict = {
     "seed_after_complete": False,  # 任务完成后继续做种（MVP 默认不做种）
     "download_rate_limit": 0,      # 下载限速 KB/s，0 = 不限（libtorrent 会话级）
     "cache_limit_mb": 2048,        # 预览缓存上限 MB，0 = 不限；超限按 LRU 清最旧预览目录
+    "preview_cache_mode": PREVIEW_CACHE_CONVERT,
+    # 关预览行为：convert=自动转正继续缓存（迅雷式）| hold=暂停冻结（基线）。
+    # 下次关闭预览时生效（stop_preview 现读现判，审查 Minor-8 修正措辞）；
+    # 值域即两常量（cache_mode.py），不新增校验逻辑。
     "logging_enabled": True,       # 运行日志开关（core.logutil；关闭后全部记录降为空操作）
+    "ui_theme": "light",           # 界面主题：light（默认浅色）| dark | system（跟随系统）
+                                   # 保存设置即热切换（ui.theme.apply_theme），无需重启
 }
 
 _TYPES: dict = {

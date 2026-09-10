@@ -38,6 +38,19 @@ datas = collect_data_files("PySide6", includes=[
     "plugins/imageformats/*",
 ])
 
+# UI 箭头资源（ui/assets/*.svg）：与 magnet-viewer.spec **逐字同步**。
+# 下拉/微调右侧分区的箭头由 QSS `image: url(<绝对路径>)` 读取
+# （ui.theme.asset_path → sys._MEIPASS/ui/assets/<name>），不打包就画不出箭头。
+import os as _os
+
+UI_ASSETS = ("chevron-down-light.svg", "chevron-up-light.svg",
+             "chevron-down-dark.svg", "chevron-up-dark.svg")
+for _name in UI_ASSETS:
+    _src = _os.path.join("ui", "assets", _name)
+    if not _os.path.isfile(_src):
+        raise SystemExit(f"[spec] 缺少 UI 箭头资源：{_src}")
+    datas.append((_src, _os.path.join("ui", "assets")))
+
 a = Analysis(
     ["main.py"],
     pathex=["."],

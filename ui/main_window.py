@@ -3,18 +3,20 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 
 from PySide6.QtCore import (QObject, QTimer, QStringListModel, Qt, QUrl,
                             Signal)
 from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (QCompleter, QFileDialog, QHBoxLayout,
                                QInputDialog, QLabel, QLineEdit, QMainWindow,
-                               QMessageBox, QPushButton, QTabWidget,
-                               QVBoxLayout, QWidget)
+                               QMessageBox, QProgressBar, QPushButton,
+                               QTabWidget, QVBoxLayout, QWidget)
 
 from core.cache_guard import (clear_cache_contents, ensure_cache_dir,
                               guard_ok_for_cleanup)
-from core.cache_quota import dir_size_bytes, enforce_preview_limit
+from core.cache_mode import PREVIEW_CACHE_CONVERT
+from core.cache_quota import downloaded_bytes, enforce_preview_limit
 from core.config import AppConfig
 from core.fetcher import SessionManager
 from core import logutil
@@ -26,21 +28,25 @@ from ui.add_download_dialog import AddDownloadDialog
 from ui.downloads_pane import DownloadsPane
 from ui.file_tree import FileTreeWidget
 from ui.preview_pane import PreviewPane
+from ui.preview_player import WAIT_DATA, WAIT_INDEX
 from ui.settings_dialog import SettingsDialog
 from ui.status_panel import StatusPanel
-from ui.theme import TEXT_MUTED
+from ui.theme import SP_LG, SP_MD, SP_SM
 
 TAB_FILES, TAB_PREVIEW, TAB_DOWNLOADS = 0, 1, 2
 
 
-def _clear_preview_cache(cache_dir: str) -> int:
+def _clear_preview_cache(cache_dir: str,
+                         keep_dirs: set[str] = ()) -> int:
     """只清预览缓存内容，保留 downloads/ 与任务持久化文件。
 
     统一走 core.cache_guard.clear_cache_contents 的保留名单（决策 D8/D9）；
     返回删除的条目数。注意：设置对话框「立即清理」曾在此之后再无名单清空
     整个目录、误删用户下载数据（P0-1）——所有清理入口都必须经此函数。
+    ``keep_dirs``（阶段 C C1）：活任务落盘目录快照（protected_dirs()），
+    连同内容整体跳过——convert 转正任务的目录仍在 .preview/<ih> 下。
     """
-    return clear_cache_contents(cache_dir)
+    return clear_cache_contents(cache_dir, keep_dirs=keep_dirs)
 
 
 class _Bridge(QObject):
@@ -71,6 +77,45 @@ def task_id(task: dict) -> str:
     """任务唯一键：id 优先，回落 info_hash（下载页契约字段）。"""
     tid = task.get("id") or task.get("info_hash") or ""
     return str(tid)
+
+
+def background_cache_text(mode: str, preview_file,
+                          file_progress: list) -> str | None:
+    """convert 档播放中的后台缓存进度文案（阶段 D D3）；其余场景 None。
+
+    引擎在预览期就按 file-priority 全量下载整个文件（A0 实证），
+    「缓冲 xx%」只反映播放位置前的连续窗口——用户看不到整文件其实
+    在攒。补一行整文件进度注记；数据源用 status() 现成的
+    file_progress 数组（零新增查询路径）。hold 档关预览即冻结、
+    播放期同样在全下但转正语义不存在，文案维持基线不变。
+    """
+    if (mode != PREVIEW_CACHE_CONVERT or preview_file is None
+            or not file_progress or preview_file.size <= 0):
+        return None
+    try:
+        done = int(file_progress[preview_file.index])
+    except (IndexError, TypeError, ValueError):
+        return None
+    pct = max(0, min(100.0, done * 100.0 / preview_file.size))
+    return f"后台缓存完整文件：{pct:.1f}%（播放位置优先）"
+
+
+def cache_usage_text(downloaded: int, limit_bytes: int) -> str:
+    """状态栏「缓存占用」文案（纯函数，plan/07 阶段 3）。
+
+    口径 = **已下载字节**（``downloaded_bytes(file_progress)``），不再是目录
+    预分配尺寸：真机 4.1GB 稀疏文件才下 59MB 却显示「缓存 4.1 GB / 2.0 GB」，
+    既误导又像爆缓存。``limit_bytes`` 为预览缓存上限（0/负 = 不限制）：
+    不限制时仅在确有下载量时返回文案（避免常驻噪音），否则返回空串
+    （调用方隐藏标签）；有上限时恒显示「已下载 / 上限」，0 字节也显示——
+    让用户看到配额在生效。
+
+    注意：**仅用于显示**——配额判定仍按目录占用（``dir_size_bytes``，
+    管磁盘占用、需保守），两者口径不同。
+    """
+    if limit_bytes <= 0:
+        return f"缓存 {human_size(downloaded)}" if downloaded > 0 else ""
+    return f"缓存 {human_size(downloaded)} / {human_size(limit_bytes)}"
 
 
 class StreamCallbacks:
@@ -136,8 +181,21 @@ class StreamCallbacks:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        # ---- 关窗异步化状态（plan 阶段 A A2）----
+        # 放在最前：停机窗口守卫（I2 整改）会在入口/桥回调首行读它，而这些
+        # 函数理论上可能在构造期被 Qt/信号回调触达（属性必须先于任何 UI 动作存在）。
+        self._shutting_down = False       # 已真正关窗（closeEvent 放行依据/幂等）
+        self._shutdown_started = False    # 停机窗口已开始（守卫依据；只置真不复位）
+        self._shutdown_stage = ""         # 后台线程写的进度文案（GUI 轮询读取）
+        self._shutdown_done = False       # 后台线程完成标志
+        self._shutdown_overlay = None
+        self._shutdown_label = None
+        self._shutdown_timer = None
         self.setWindowTitle("磁力链实时解析查看器 Magnet Viewer")
-        self.resize(1040, 700)
+        # 双主题 + 视觉规格（用户拍板）：更大的默认窗口让文件树/画廊有呼吸感，
+        # 并给最小尺寸兜底（小于此值布局会挤成一团）。
+        self.resize(1200, 800)
+        self.setMinimumSize(960, 640)
         self._setup_core()
         # ---- UI ----
         self._build_ui()
@@ -170,7 +228,10 @@ class MainWindow(QMainWindow):
         self.session = SessionManager(
             self.cache_dir,
             download_dir=str(self.cfg.get("download_dir") or "").strip() or None,
-            active_downloads=int(self.cfg.get("default_concurrency") or 3))
+            active_downloads=int(self.cfg.get("default_concurrency") or 3),
+            # 阶段 B：预览缓存模式（convert/hold）——每次关预览时现读，
+            # 保存设置即「下次关预览生效」，无需重建会话。
+            cache_mode_get=lambda: self.cfg.get("preview_cache_mode"))
         self.session.start(proxy=self.cfg.proxy(),
                            metadata_timeout=self.cfg.get("metadata_timeout"))
         # 会话级限速 + 日志开关：启动即按配置应用（P2-18 此前承诺了
@@ -262,6 +323,8 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent):
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         md = event.mimeData()
         if md.hasUrls():
             for url in md.urls():
@@ -280,10 +343,20 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         central = QWidget(self)
         root = QVBoxLayout(central)
+        # 顶栏 / 状态栏做成通栏色带（圆角卡片由 QSS #topBar 负责）：
+        # 外边距保持 0（通栏），纵向间距 12px 给三段色带之间留呼吸感
+        # （旧版 0 间距，界面挤在一起）。
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(SP_MD)
 
-        # 顶栏
-        bar = QHBoxLayout()
+        # 顶栏（#topBar：面板底色 + 下边框）
+        bar_wrap = QWidget()
+        bar_wrap.setObjectName("topBar")
+        bar = QHBoxLayout(bar_wrap)
+        bar.setContentsMargins(SP_LG, SP_MD, SP_LG, SP_MD)
+        bar.setSpacing(SP_MD)
         self.input = QLineEdit()
+        self.input.setObjectName("urlInput")
         self.input.setPlaceholderText("粘贴 magnet:?xt=urn:btih:... 磁力链接，或点击右侧按钮选择 .torrent 文件")
         self.btn_open = QPushButton("打开种子文件…")
         self.btn_resolve = QPushButton("解析")
@@ -300,23 +373,14 @@ class MainWindow(QMainWindow):
         self.btn_add_download.clicked.connect(self._add_download_flow)
         bar.addWidget(self.btn_add_download)
         self.btn_settings = QPushButton("设置")
-        self.btn_settings.setFixedWidth(56)
+        self.btn_settings.setObjectName("ghost")
         self.btn_settings.clicked.connect(self._open_settings)
         bar.addWidget(self.btn_settings)
-        root.addLayout(bar)
-
-        self.hint = QLabel()
-        # 模板保存原始指引文案：保存设置时只替换超时数字，不截断其他部分
-        self._hint_template = ("解析只获取文件清单（不下载资源本体）；"
-                               "双击视频/图片文件即可在「预览」页边下边播或浏览。"
-                               "磁力链元数据获取超时 {} 秒。")
-        self.hint.setText(
-            self._hint_template.format(int(self.session.metadata_timeout)))
-        self.hint.setStyleSheet(f"color:{TEXT_MUTED}; font-size:12px;")
-        root.addWidget(self.hint)
+        root.addWidget(bar_wrap)
 
         # 页签
         self.tabs = QTabWidget()
+        self.tabs.setObjectName("mainTabs")
         self.tree = FileTreeWidget()
         self.preview = PreviewPane()
         self.downloads = DownloadsPane()
@@ -326,14 +390,33 @@ class MainWindow(QMainWindow):
         self.tabs.setTabEnabled(TAB_PREVIEW, False)
         root.addWidget(self.tabs, 1)
 
-        # 状态栏
+        # hint：移到页签下方、状态栏上方（与输入框同行会挤顶栏）
+        self.hint = QLabel()
+        # 模板保存原始指引文案：保存设置时只替换超时数字，不截断其他部分
+        self._hint_template = ("解析只获取文件清单（不下载资源本体）；"
+                               "双击视频/图片文件即可在「预览」页边下边播或浏览。"
+                               "磁力链元数据获取超时 {} 秒。")
+        self.hint.setText(
+            self._hint_template.format(int(self.session.metadata_timeout)))
+        self.hint.setObjectName("hint")
+        self.hint.setContentsMargins(SP_LG, SP_SM, SP_LG, SP_SM)
+        root.addWidget(self.hint)
+
+        # 状态栏（#statusBar：面板底色 + 上边框）
         self.status_panel = StatusPanel()
         root.addWidget(self.status_panel)
         self.setCentralWidget(central)
 
     def _open_settings(self):
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         dlg = SettingsDialog(self.cfg, self.cache_dir,
-                             on_clear_cache=self._clear_cache_now, parent=self)
+                             on_clear_cache=self._clear_cache_now,
+                             # C1：注入活名单取器（UI 不直闯 core：闭包封装
+                             # session.protected_dirs），对话框清编辑框当前值时
+                             # 同样复核活任务目录（含转正的 .preview/<ih>）
+                             keep_dirs_get=self._live_cache_dirs,
+                             parent=self)
         if dlg.exec() == SettingsDialog.DialogCode.Accepted:
             # 代理与超时立即生效（缓存目录重启生效）
             self.session.apply_proxy(self.cfg.proxy())
@@ -352,22 +435,54 @@ class MainWindow(QMainWindow):
 
         决策 D8：downloads/（用户下载数据）与任务持久化文件（.tasks.json /
         .resume）不在清理范围；守卫校验不变（受管标记）。
+
+        阶段 C C1（Important-2 收口）：convert 转正任务目录仍在 .preview/<ih>
+        （沿用已下分块零重下）——清理前复核 session.protected_dirs()，活任务
+        目录连同内容整体跳过，杜绝「清完引擎对着空目录重下」的互噬永动机。
         """
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         self._stop_preview()
+        return self._clear_preview_cache_now(
+            keep_dirs=self._live_cache_dirs(),
+            log_key="main.clear_cache_now")
+
+    def _live_cache_dirs(self) -> set[str]:
+        """活任务落盘目录快照（protected_dirs()）——**手动/退出清理入口**的
+        C1 复核名单。
+
+        会话异常（未启动/已停机竞态）兜底空集：清理退回基线行为，绝不
+        因取名单失败而阻断清理主流程（旁路纪律，fail-open 有意为之）。
+        注意：LRU 配额（_enforce_cache_quota）不走本方法——那条路必须
+        fail-closed（名单故障→零删除），见 D0（审查 Important-1）。
+        """
+        try:
+            return set(self.session.protected_dirs())
+        except Exception as e:
+            log_warning("main.live_cache_dirs", f"取活任务名单失败：{e}")
+            return set()
+
+    def _clear_preview_cache_now(self, keep_dirs: set[str] = (),
+                                 log_key: str = "main.clear_cache") -> int:
+        """守卫 + 清理的统一执行段（手动清理/退出清理共用，D8/D9/C1）。
+
+        ``keep_dirs``：活任务目录快照（连同内容整体跳过清理）。返回删除
+        条目数；守卫拒绝或清理异常返回 -1（只告警）。
+        """
         if not guard_ok_for_cleanup(self.cache_dir):
-            log_warning("main.clear_cache_now",
-                        f"拒绝清理非受管缓存目录：{self.cache_dir}")
+            log_warning(log_key, f"拒绝清理非受管缓存目录：{self.cache_dir}")
             return -1
         try:
-            cleanup = _clear_preview_cache(self.cache_dir)
+            return _clear_preview_cache(self.cache_dir, keep_dirs=keep_dirs)
         except Exception as e:
-            log_warning("main.clear_cache_now", f"清理失败：{e}")
+            log_warning(log_key, f"清理失败：{e}")
             return -1
-        return cleanup
 
     # ---------- 动作 ----------
 
     def _pick_torrent(self):
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         path, _ = QFileDialog.getOpenFileName(
             self, "选择种子文件", "", "种子文件 (*.torrent)")
         if path:
@@ -375,11 +490,15 @@ class MainWindow(QMainWindow):
             self._resolve(path)
 
     def _resolve_input(self):
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         text = self.input.text().strip()
         if text:
             self._resolve(text)
 
     def _resolve(self, source: str):
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         self.status_panel.set_state("解析中…（加入 DHT 网络获取元数据）")
         self.preview.reset()
         self.session.stop_preview()
@@ -399,6 +518,8 @@ class MainWindow(QMainWindow):
 
     def _add_download_flow(self):
         """顶栏「添加下载」：优先取输入框内容，否则弹输入框要来源。"""
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         text = self.input.text().strip()
         if not (text.lower().startswith("magnet:")
                 or (os.path.isfile(text) and text.lower().endswith(".torrent"))):
@@ -413,6 +534,8 @@ class MainWindow(QMainWindow):
 
     def _confirm_add_task(self, source: str):
         """添加下载确认：子目录 / 优先级 / 完成后做种 → 调 add_task。"""
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         source = (source or "").strip()
         if not source:
             self.status_panel.set_state("添加下载失败：来源为空")
@@ -440,6 +563,8 @@ class MainWindow(QMainWindow):
         return task_id(task)
 
     def _task_pause(self, task: dict):
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         tid = self._task_id(task)
         if tid and self.session.pause_task(tid):
             self.status_panel.set_state(f"已暂停任务：{task.get('name') or tid[:16]}")
@@ -447,6 +572,8 @@ class MainWindow(QMainWindow):
             self.status_panel.set_state("暂停失败：任务不存在或状态不可暂停")
 
     def _task_resume(self, task: dict):
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         tid = self._task_id(task)
         if tid and self.session.resume_task(tid):
             self.status_panel.set_state(f"已恢复任务：{task.get('name') or tid[:16]}")
@@ -454,6 +581,8 @@ class MainWindow(QMainWindow):
             self.status_panel.set_state("恢复失败：任务不存在或状态不可恢复")
 
     def _task_remove(self, task: dict):
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         tid = self._task_id(task)
         if not tid:
             return
@@ -472,6 +601,8 @@ class MainWindow(QMainWindow):
                 f"已删除任务：{name}" if ok else f"删除任务失败：{name}")
 
     def _task_priority(self, task: dict, delta: int):
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         if not hasattr(self.session, "set_priority"):
             self.status_panel.set_state("优先级调整暂未开放（后续版本接入）")
             return
@@ -496,6 +627,8 @@ class MainWindow(QMainWindow):
         任务文件在 downloads/<ih>/（或自定义子目录）落盘，已下载分块
         可边下边播（分块级流服务 + 按需补拉 + moov 尾部窗口）。
         """
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         tid = self._task_id(task)
         if tid:
             try:
@@ -535,12 +668,16 @@ class MainWindow(QMainWindow):
 
     def _preview_to_download(self):
         """预览页「转为下载」：当前预览种子直接转正为下载任务（零额外下载）。"""
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         if not self._last_source:
             self.status_panel.set_state("请先解析磁力链或种子，再转为下载")
             return
         self._confirm_add_task(self._last_source)
 
     def _on_metadata(self, result: ParseResult):
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         self.result = result
         # 以主窗口的 cache_dir 为准（不依赖解析侧注入，双重保险）；
         # 落盘目录含任务隔离子目录（.preview/<ih> 或 downloads/<ih>，见
@@ -563,10 +700,14 @@ class MainWindow(QMainWindow):
             f"共 {result.total_size / 1024 / 1024:.1f} MB · info_hash={result.info_hash[:16]}…")
 
     def _on_error(self, msg: str):
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         self.status_panel.set_state(f"失败：{msg}")
         QMessageBox.warning(self, "解析失败", msg)
 
     def _open_preview(self, f: TorrentFile):
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         if self.result is None:
             return
         self._enforce_cache_quota()
@@ -605,6 +746,8 @@ class MainWindow(QMainWindow):
 
     def _on_seek(self, byte_offset: int):
         """播放位置跳转 → 调度器从对应分块重新开始顺序下载。"""
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         if self._preview_file is not None and self._preview_file.is_video:
             self.session.scheduler.seek_to_byte(byte_offset)
 
@@ -614,14 +757,21 @@ class MainWindow(QMainWindow):
         request_range 自带 60 块上限，预取 4MB 足够开播解码；
         误预取（拖过又拖回）由下次 seek 的 clear_piece_deadlines 回收。
         """
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         if self._preview_file is not None and self._preview_file.is_video:
             self.session.scheduler.request_range(
                 byte_offset, byte_offset + 4 * 1024 * 1024)
 
     def _on_gallery_file(self, f):
         """画廊中切换到未下载的图片 → 按需下载该文件。"""
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         if f is None or f == self._preview_file:
             return
+        # A2：与 _open_preview（视频路径）对齐——预览启停前必须走缓存配额，
+        # 否则画廊连刷大量图片会绕过 limit 无上限增长。
+        self._enforce_cache_quota()
         try:
             self.session.start_preview(f)
             self._preview_file = f
@@ -636,6 +786,20 @@ class MainWindow(QMainWindow):
         只动 <cache>/.preview/<ih>/；保护名单来自 session.protected_dirs()
         （活跃句柄的落盘目录），downloads/ 与任务持久化文件天然不在
         扫描范围。limit<=0 表示用户关闭了配额。
+
+        阶段 C C2：keep_dirs 传**零参回调**而非静态快照——cache_quota 在
+        每个候选目录 rmtree 前重新取名单复核，堵住「取名单 → 磁盘扫描
+        （出锁干活，耗时）→ 执行删除」窗口内刚登记的新 review 被陈旧
+        快照漏保误删的竞态（回调内部自持 registry 锁，锁内零 libtorrent，
+        符合并发三律；锁的持有粒度不变）。
+
+        阶段 D D0（审查 Important-1）：回调**裸调** session.protected_dirs
+        ——异常上抛给 cache_quota._norm_keep 的 None 分支→本轮保守不删
+        （fail-closed 作为最后防线；protected_dirs 锁内纯读，实际不抛）。
+        不再经 _live_cache_dirs 的空集兜底（fail-open）：那个兜底只服务
+        「清理失败不阻断主流程」的手动清理入口。主要故障模式是空注册表
+        竞态（会话未起/已停机）：该场景返回空集（cache 根仍受保），维持
+        现状语义，不把空集当可疑。
         """
         limit = int(self.cfg.get("cache_limit_mb") or 0)
         if limit <= 0:
@@ -643,33 +807,49 @@ class MainWindow(QMainWindow):
         preview_root = os.path.join(self.cache_dir, ".preview")
         if not os.path.isdir(preview_root):
             return
-        keep = {os.path.normcase(p)
-                for p in self.session.protected_dirs()}
-        keep.add(os.path.normcase(self.cache_dir))
+        cache_root = os.path.normcase(self.cache_dir)
+
+        def _keep() -> set[str]:
+            # D0 fail-closed：protected_dirs 裸调——异常透传给 cache_quota
+            # 属最后防线（该方法锁内纯读，实际不抛；主要故障模式=空注册表
+            # 竞态，返回空集、维持现状语义，见 D5-B）；每次解析现取（含
+            # cache 根兜底保护，语义与原静态快照一致）。
+            return {os.path.normcase(p)
+                    for p in self.session.protected_dirs()} | {cache_root}
         try:
-            total, _freed = enforce_preview_limit(
-                preview_root, limit, keep,
+            _total, _freed = enforce_preview_limit(
+                preview_root, limit, _keep,
                 warn=lambda m: log_warning("main.cache_quota", m))
         except Exception as e:
             log_warning("main.cache_quota", f"配额清理异常（已忽略）：{e}")
             return
-        self._update_cache_usage(total)
+        # 清理后刷新显示：口径 = 已下载字节（阶段 3），不再用返回的目录占用
+        self._refresh_cache_usage()
 
     def _refresh_cache_usage(self):
-        """刷新状态栏缓存占用显示（低频：30 秒定时器 + 打开设置后）。"""
-        preview_root = os.path.join(self.cache_dir, ".preview")
-        total = dir_size_bytes(preview_root) if os.path.isdir(preview_root) else 0
-        self._update_cache_usage(total)
+        """刷新状态栏缓存占用显示（低频：30s 定时器 + 配额清理后）。
 
-    def _update_cache_usage(self, total_bytes: int):
+        口径 = **已下载字节**（``status().file_progress`` 汇总，plan/07
+        阶段 3）——显示「真实下了多少」而非稀疏预分配尺寸。配额**判定**仍
+        走目录占用（``_enforce_cache_quota`` → ``enforce_preview_limit``），
+        两者解耦：显示跟着进度走，上限管磁盘占用（保守）。
+        """
+        self._update_cache_usage(self._downloaded_bytes())
+
+    def _downloaded_bytes(self) -> int:
+        """当前任务已下载字节（file_progress 汇总；无会话/异常 → 0）。"""
+        try:
+            st = self.session.status()
+        except Exception as e:
+            log_warning("main.cache_usage", f"{e}")
+            return 0
+        return downloaded_bytes((st or {}).get("file_progress") or [])
+
+    def _update_cache_usage(self, downloaded: int):
+        """渲染缓存占用文案（纯函数 ``cache_usage_text``：已下载 / 上限）。"""
         limit = int(self.cfg.get("cache_limit_mb") or 0)
-        if limit > 0:
-            self.status_panel.set_cache_usage(
-                f"缓存 {human_size(total_bytes)} / {human_size(limit * 1024 * 1024)}")
-        else:
-            # 不限制时仅在确有占用时提示，避免常驻噪音
-            self.status_panel.set_cache_usage(
-                f"缓存 {human_size(total_bytes)}" if total_bytes > 0 else "")
+        self.status_panel.set_cache_usage(
+            cache_usage_text(downloaded, limit * 1024 * 1024))
 
     def _pieces_map(self, disk_path: str):
         """流服务回调（薄委托，逻辑在 StreamCallbacks.pieces_map）。"""
@@ -692,8 +872,14 @@ class MainWindow(QMainWindow):
         self.status_panel.update_status(st)
         self.preview.gallery.update_status(st)
         if self._preview_file is not None and st is not None:
-            self.preview.video.update_buffer(st.get("buffer", 0.0),
-                                             st.get("download_rate", 0))
+            self.preview.video.update_buffer(
+                st.get("buffer", 0.0),
+                st.get("download_rate", 0),
+                # D3：convert 档播放中补「后台缓存完整文件」注记（现成的
+                # file_progress 数组，零新增查询路径；hold 档恒 None）
+                background_cache_text(str(self.cfg.get("preview_cache_mode")),
+                                      self._preview_file,
+                                      st.get("file_progress") or []))
             # 进度条缓冲分段着色（一次批量取块位图，见 fetcher 注释）
             try:
                 segs = self.session.buffered_segments_of_preview()
@@ -707,18 +893,33 @@ class MainWindow(QMainWindow):
             self.downloads.set_tasks(self.session.tasks())
         except Exception as e:
             log_warning("main.refresh_tasks", f"{e}")
-        # 视频开播条件：头部连续数据 + 尾部索引块（moov）都已就绪
+        # 视频开播条件：头部连续数据 + 尾部**入口**就绪（plan/07 阶段 2）。
+        # 入口 = 文件最后 min(2MB, size) 覆盖的块（moov 所在），**不是**整尾窗：
+        # 4.1GB / 4MB 块真机上整尾窗 44MB 在 2.4MB/s 下要 ≈18s 才齐，旧的
+        # 「整尾窗就绪」门控因此永不满足（缓冲恒 0.0%、30s 不见画面）；
+        # 入口只需最末 1 块。整尾窗仍在后台由 scheduler.tick() 继续补拉，
+        # 万一 moov 大于入口，播放器打开失败会走 _on_stream_failed 退避重试。
         if self._pending_video is not None and st is not None:
             f, url = self._pending_video
             contig = st.get("contiguous", 0)
-            if contig >= min(1024 * 1024, f.size) and st.get("tail_ready", True):
+            data_ok = contig >= min(1024 * 1024, f.size)
+            index_ok = bool(st.get("tail_entry_ready", True))
+            if data_ok and index_ok:
                 self._pending_video = None
                 self.preview.video.set_stream(url, f.name, f.size)
+            else:
+                # 阶段 3：等数据 / 等索引块分句提示。**仅文案分支**——放行
+                # 判据是上面的布尔量，文案不反过来驱动门控（本轮询方法也
+                # 不读文案）。
+                self.preview.video.set_waiting_stage(
+                    WAIT_DATA if not data_ok else WAIT_INDEX)
 
     # ---------- 播放失败重试 ----------
 
     def _on_stream_failed(self):
         """播放器打开媒体失败：多半是索引块/数据仍在下载，稍后重试。"""
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         if self._preview_file is None or self._pending_video is not None:
             return  # 已停止或尚未开播
         if self._stream_url is None:
@@ -732,6 +933,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(delay, self._retry_stream)
 
     def _retry_stream(self):
+        if self._shutdown_started:
+            return          # 停机窗口守卫（I2）：不启新工作、不弹模态
         if self._preview_file is None or self._stream_url is None:
             return
         if self._pending_video is not None:
@@ -740,8 +943,10 @@ class MainWindow(QMainWindow):
         if st is None:
             QTimer.singleShot(1500, self._retry_stream)
             return
-        if not st.get("tail_ready", True) or st.get("contiguous", 0) < 1:
-            # 数据仍未就绪：静默等待，不算失败次数，避免反复弹错误
+        if (not st.get("tail_entry_ready", True)) or st.get("contiguous", 0) < 1:
+            # 数据仍未就绪（尾部入口/头部前缀）：静默等待，不算失败次数，
+            # 避免反复弹错误。判据与开播门控同源（入口而非整尾窗）——
+            # 否则门控已放行、这里却继续等整尾窗到位，出现「能开却不重试」。
             QTimer.singleShot(1500, self._retry_stream)
             return
         # 带上出错前的位置续播：setSource 会从头开始，不带位置的话
@@ -754,18 +959,170 @@ class MainWindow(QMainWindow):
 
     # ---------- 关闭 ----------
 
-    def closeEvent(self, event):
+    # 硬超时：后台收尾卡死时也必须能真正关掉（plan A2）
+    SHUTDOWN_HARD_TIMEOUT_MS = 10000
+
+    def _shutdown_worker(self) -> None:
+        """关闭收尾（**后台线程**执行）：快照 → 停会话 → 停流服务 → 可选清缓存。
+
+        为什么要异步（Minor 10 文案诚实化，口径 = close_lag_probe 实测）：
+        关窗约 3.8s 的真来源是 **session.shutdown()**——内部 2s join + 最多
+        3s fastresume drain，再加 remove_torrent/会话析构的磁盘 flush——另加
+        server.shutdown ≈0.5s。退出清理的 rmtree 很便宜（实测 200MB .preview
+        约 15ms），**不是**耗时主因（旧注释把「清 GB 级缓存要数秒」当既定
+        事实，已按实测改写）。全部在 GUI 线程做就是「关闭卡死」。
+
+        硬超时风险（Minor 5）：本方法跑在 **daemon 线程**上；硬超时
+        （``SHUTDOWN_HARD_TIMEOUT_MS``）到点会强制关窗并结束进程——此时本
+        线程可能被**中途结束**，最新一次续传状态（fastresume）可能来不及
+        落盘，下次启动按更早的 ``.resume`` 续传（或对未确认分块重新校验）。
+
+        C1 铁律不变：保护名单快照必须在 shutdown 之前取。
+
+        本方法运行在后台线程：**绝不碰任何 QWidget**，只写
+        ``self._shutdown_stage`` 字符串（进度文案由 GUI 线程的
+        ``_poll_shutdown`` 更新）；完成标志 ``self._shutdown_done`` 同理。
+        """
         try:
+            self._shutdown_stage = "正在保存任务状态…"
+            # D4b：clear_cache_on_exit 单读（旧实现在名单快照与清理分支
+            # 各读一次——双读之间设置被改会「快照了却不清理/清理了没快照」
+            # 的错拍，且 False 时白算一遍 protected_dirs()）。
+            # C1 时机结论（实证 core/session.SessionCore.shutdown）：shutdown
+            # 末段 clear_runtime_state_locked() 清空注册表——**事后**
+            # protected_dirs() 必为空。名单快照必须在 shutdown 之前抓。
+            exit_clear = bool(self.cfg.get("clear_cache_on_exit"))
+            exit_keep = self._live_cache_dirs() if exit_clear else set()
             self.session.shutdown()
+            self._shutdown_stage = "正在停止流服务…"
             self.server.shutdown()
-            if self.cfg.get("clear_cache_on_exit"):
+            if exit_clear:
                 # 决策 D8：退出清理只清预览缓存，downloads/（用户下载数据）
                 # 与任务持久化文件（.tasks.json/.resume）保留；
-                # 根目录仍须通过受管标记守卫（拒绝清非受管目录）
-                if not guard_ok_for_cleanup(self.cache_dir):
-                    log_warning("main.close.clear_cache",
-                                f"拒绝清理非受管缓存目录：{self.cache_dir}")
-                else:
-                    _clear_preview_cache(self.cache_dir)
+                # 根目录仍须通过受管标记守卫（拒绝清非受管目录）。
+                # 阶段 C C1：清理在 shutdown（句柄已全部移除、文件锁释放）
+                # **之后**执行，但保护名单用 shutdown **之前**的快照——
+                # convert 转正任务目录（.preview/<ih>）连同内容跳过：清单与
+                # .resume 保留、重启 restore 续传，文件不被删光（防互噬）。
+                self._shutdown_stage = "正在清理预览缓存…"
+                self._clear_preview_cache_now(
+                    keep_dirs=exit_keep, log_key="main.close.clear_cache")
+        except Exception as e:
+            log_warning("main.shutdown_worker", f"{e}")
         finally:
+            self._shutdown_done = True
+
+    def closeEvent(self, event):
+        """关闭：阻塞工作交给后台线程，GUI 只显示遮罩并轮询（plan A2）。
+
+        第一次 ``close()``：忽略事件 → 停周期轮询 → 起遮罩 + 后台线程 +
+        100ms 轮询 + 10s 硬超时；后台完成或硬超时后置 ``_shutting_down``
+        再 ``close()`` 一次，此时直接放行。窗口在遮罩期间始终可响应，
+        不会出现 Windows 的「未响应」白屏。
+
+        两个与 ``_shutting_down`` 分开的标志：
+        - ``_shutdown_started``：停机窗口**一开始**就置真且不再复位——I2
+          整改的守卫读它（窗口期内与关窗后都不许再起新工作/弹模态）。
+          ``_shutting_down`` 的真实语义是「已真正关窗」（本方法用它放行
+          关闭），窗口期它仍是假，不能当守卫依据。
+        - 遮罩已存在时再次 close：直接 ignore 返回（Minor 7：不重复起后台
+          线程、不提前关窗）。
+
+        Minor 6（审查）：本段整体包 try/except——异步化组件（遮罩/线程/
+        定时器）逆常时**回退** ``super().closeEvent(event)`` 放行关闭；否则
+        事件已被 ``ignore()``，窗口永远关不掉（只能杀进程）。
+        """
+        if self._shutting_down:
             super().closeEvent(event)
+            return
+        if self._shutdown_overlay is not None:
+            event.ignore()          # 停机窗口期内的重复关闭：什么都不重做
+            return
+        try:
+            event.ignore()
+            # 停掉周期轮询：会话正在后台停机，700ms 状态刷新会打到半死的
+            # 会话/字符串判据上；旧实现阻塞在 GUI 线程，天然不存在这段
+            # 窗口期，异步化后必须显式停（关窗后也不再需要状态显示）。
+            for t in (getattr(self, "_status_timer", None),
+                      getattr(self, "_cache_timer", None)):
+                if t is not None:
+                    t.stop()
+            self._shutdown_started = True
+            self._show_shutdown_overlay()
+            threading.Thread(target=self._shutdown_worker,
+                             daemon=True).start()
+            self._shutdown_timer = QTimer(self)
+            self._shutdown_timer.setInterval(100)
+            self._shutdown_timer.timeout.connect(self._poll_shutdown)
+            self._shutdown_timer.start()
+            QTimer.singleShot(self.SHUTDOWN_HARD_TIMEOUT_MS, self._force_close)
+        except Exception as e:      # noqa: BLE001
+            # 逆常回退（Minor 6）：异步化跑不起来也要把窗口关掉。
+            log_warning("main.close_event", f"异步化关窗失败，回退同步放行：{e}")
+            self._shutting_down = True      # 幂等依据（后续 close 走放行分支）
+            try:
+                if self._shutdown_timer is not None:
+                    self._shutdown_timer.stop()
+            except Exception:               # noqa: BLE001
+                pass
+            super().closeEvent(event)
+
+    def resizeEvent(self, event):
+        """窗口几何变化：停机遮罩须同步跟随（Minor 9 审查整改）。
+
+        遮罩是主窗口子部件，几何只在创建时取一次 ``centralWidget().geometry()``；
+        窗口在跑时被 resize（拖边框/最大化/DPI 变化）遮罩就会错位——只盖住
+        旧区域，窗口右/下侧露出未被遮罩的内容。
+        """
+        super().resizeEvent(event)
+        ov = self._shutdown_overlay
+        if ov is None:              # 未起遮罩（正常期）或构造期：无事可做
+            return
+        c = self.centralWidget()
+        if c is not None:
+            ov.setGeometry(c.geometry())
+
+    def _show_shutdown_overlay(self):
+        """半透明遮罩 + 一行进度文案（居中），盖住 centralWidget。"""
+        ov = QWidget(self)
+        ov.setObjectName("shutdownOverlay")
+        # I4（审查）：显式声明「样式化背景」——QSS 的 background 才会被绘制，
+        # 不依赖样式引擎 polish 期的隐式置位（实测 PySide6 6.11 会替被规则
+        # 命中的 QWidget 自动打开该位；显式置位在正常/逆常下都成立，且**不会
+        # 双绘**——实测像素逐点一致，见 close_lag_test 的绘制层断言）。
+        ov.setAttribute(Qt.WA_StyledBackground, True)
+        lay = QVBoxLayout(ov)
+        lay.setAlignment(Qt.AlignCenter)
+        self._shutdown_label = QLabel("正在保存并退出…")
+        self._shutdown_label.setObjectName("shutdownLabel")
+        self._shutdown_label.setAlignment(Qt.AlignCenter)
+        bar = QProgressBar()
+        bar.setObjectName("shutdownBar")
+        bar.setRange(0, 0)          # 不确定进度
+        bar.setFixedWidth(260)
+        bar.setFixedHeight(6)
+        lay.addWidget(self._shutdown_label, 0, Qt.AlignHCenter)
+        lay.addWidget(bar, 0, Qt.AlignHCenter)
+        ov.setGeometry(self.centralWidget().geometry())
+        ov.raise_()
+        ov.show()
+        self._shutdown_overlay = ov
+
+    def _poll_shutdown(self):
+        """GUI 线程轮询（100ms）：刷新进度文案；后台完成则真正关窗。"""
+        if self._shutdown_label is not None and self._shutdown_stage:
+            self._shutdown_label.setText(self._shutdown_stage)
+        if self._shutdown_done:
+            self._force_close()
+
+    def _force_close(self):
+        """真正关窗（后台完成 / 硬超时共用）。"""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        try:
+            if self._shutdown_timer is not None:
+                self._shutdown_timer.stop()
+        except Exception:
+            pass
+        self.close()

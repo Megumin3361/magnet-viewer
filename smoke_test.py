@@ -123,6 +123,7 @@ def main():
     # DEFAULTS 里——按文档调用 AppConfig.get 会 KeyError，且无任何接线。
     from core.config import DEFAULTS as _DEF, _TYPES as _TTYPES
     for _k, _v in (("download_rate_limit", 0), ("cache_limit_mb", 2048),
+                   ("preview_cache_mode", "convert"),
                    ("logging_enabled", True)):
         assert _k in _DEF and _DEF[_k] == _v, f"DEFAULTS 缺键或默认值错误: {_k}"
     assert _TTYPES.get("logging_enabled") is bool
@@ -170,6 +171,61 @@ def main():
         "无保护时应按 LRU 删较旧的 keep_dir、保留较新的 new"
     assert freed2 == 500 * 1024 and _t2 == 900 * 1024, \
         f"删除后应恰好回到上限内: total={_t2} freed={freed2}"
+    # keep_dirs 回调（callable）形态：C2——enforce 内部在**每次 rmtree 前**
+    # 重新解析名单，堵住「取名单 → 扫描 → 执行删除」窗口内新登记目录被误删。
+    # 独立目录树，避免与上方静态集合用例互相干扰。
+    q2 = os.path.join(tmp, "quota2", ".preview")
+    os.makedirs(q2, exist_ok=True)
+
+    def _mk2(ih: str, size: int, mtime: float) -> str:
+        d = os.path.join(q2, ih)
+        os.makedirs(d, exist_ok=True)
+        fp = os.path.join(d, "chunk.bin")
+        with open(fp, "wb") as fh:
+            fh.write(b"x" * size)
+        os.utime(fp, (mtime, mtime))
+        return d
+
+    race = _mk2("d" * 40, 600 * 1024, 1_000_000_000)  # 最旧（LRU 第一候选）
+    other = _mk2("e" * 40, 900 * 1024, 2_000_000_000)
+    # 第 1 次解析（enforce 入口快照）返回空集；第 2 次起（删除前复核）返回
+    # race——模拟「入口取名单之后、rmtree 之前」新登记了一个 review。
+    resolves: list[int] = []
+
+    def _late_registrar():
+        resolves.append(1)
+        return set() if len(resolves) == 1 else {os.path.normcase(race)}
+
+    _t3, freed3 = cache_quota.enforce_preview_limit(
+        q2, 1, keep_dirs=_late_registrar, warn=lambda m: None)
+    assert os.path.isdir(race), \
+        "C2 竞态：入口快照未含、删除前复核命中的活目录不得被删"
+    assert not os.path.isdir(other), \
+        f"复核只救新登记目录，无保 LRU 候选照常清理（freed={freed3}）"
+    assert freed3 == 900 * 1024, \
+        f"仅删除 other 计入 freed（实得 {freed3}）"
+    # 回调集合里的相对路径须归一命中（与入口 keep 判定同语义）：race 是最旧
+    # 候选（无保必删），relp 较新；保护生效时删 relp、race 幸存。
+    _save_cwd = os.getcwd()
+    os.chdir(q2)
+    relp = _mk2("f" * 40, 700 * 1024, 1_100_000_000)   # 较新
+    race_c = os.path.relpath(race, q2)
+    _t4, freed4 = cache_quota.enforce_preview_limit(
+        q2, 1, keep_dirs=lambda: {race_c}, warn=lambda m: None)
+    os.chdir(_save_cwd)
+    assert os.path.isdir(race), "回调返回相对路径也须命中保护（归一对齐）"
+    assert not os.path.isdir(relp), \
+        f"保护只豁免命中目录，LRU 次旧候选照常删（freed={freed4}）"
+    # 回调抛异常：保守跳过本轮全部删除（绝不因名单故障扩大删除面），不冒泡
+    big = _mk2("g" * 40, 900 * 1024, 900_000_000)      # 最旧，无保时必删
+    def _boom():
+        raise RuntimeError("名单取用失败")
+    _t5, freed5 = cache_quota.enforce_preview_limit(
+        q2, 1, keep_dirs=_boom, warn=lambda m: None)
+    assert os.path.isdir(race) and os.path.isdir(big), \
+        "keep_dirs 回调抛异常：保守不删（绝不因名单故障扩大删除面）"
+    assert freed5 == 0, f"回调异常时 freed 必须为 0（实得 {freed5}）"
+    # 静态集合形态向后兼容：上方既有用例已覆盖（keep_dirs={keep_dir}）
     print(f"[2d] 设置接线通过：限速/日志开关/配额 LRU（LRU 释放 "
           f"{human_size(freed)}）")
 
@@ -617,6 +673,8 @@ def main():
             self.deadlines = []
             self.prios = None
             self.cleared = 0
+            self.paused_n = 0
+            self.unset_calls: list = []
 
         def torrent_file(self):
             return self.ti
@@ -635,7 +693,7 @@ def main():
             self.prios = list(prios)
 
         def unset_flags(self, _f):
-            pass
+            self.unset_calls.append(_f)
 
         def set_flags(self, _f):
             pass
@@ -644,7 +702,7 @@ def main():
             pass
 
         def pause(self):
-            pass
+            self.paused_n += 1
 
     pl_s = 1024 * 1024
     f_sched = TorrentFile(0, "root/demo.mp4", 100 * pl_s, 0, 0, 99)   # 100 块
@@ -652,15 +710,23 @@ def main():
     sched = PreviewScheduler()
     sched.begin(h_sched, f_sched)
     dl = set(h_sched.deadlines)
-    assert dl >= set(range(0, 61)), "开播顺序窗口未预约"
-    assert dl >= {96, 97, 98, 99}, "尾部 moov 窗口未预约"
+    # plan/07 阶段 1：窗口块数按字节预算换算（16MB / 1MB 块 = 16 块），
+    # 不再是固定 60 块——旧断言 range(0,61) 是 4MB 块下 240MB 全 ASAP
+    # 洪泛的来源，已由 playback_window_test 专项覆盖。
+    assert dl >= set(range(0, 16)), "开播顺序窗口未预约"
+    # plan/07 阶段 2：尾窗按字节收敛（100MB → max(2MB, 0.25%·size)=2MB = 2 块），
+    # 旧断言 {96..99}（4MB 尾窗）随之收窄；尾部**入口**（最末 2MB）另行由
+    # tail_entry_ready 门控，整尾窗仍在此预约。
+    assert dl >= {98, 99}, f"尾部 moov 窗口未预约：{sorted(dl)}"
     assert h_sched.prios == [4, 0, 0], h_sched.prios
     # 拖动到 80MB：必须立即预约 seek 点起的窗口（旧实现只改锚点、不预约）
     h_sched.deadlines.clear()
     sched.seek_to_byte(80 * pl_s)
     dl = set(h_sched.deadlines)
     assert 80 in dl, "seek 后未立即预约 seek 点"
-    assert dl >= set(range(80, 100)), sorted(dl)[:5]
+    # 头窗 = window_pieces(1MB)=16 块 [80..95]；尾窗收敛为 {98,99}（阶段 2）——
+    # 96/97 落在两者之间本就不在预约面内（由 tick() 随进度滚动补上）。
+    assert dl >= (set(range(80, 96)) | {98, 99}), sorted(dl)
     # 点播区间必须有上限：拖动的 `bytes=X-`（到文件尾）不能把剩余全文件置 ASAP
     h_sched.deadlines.clear()
     sched.request_range(0, 100 * pl_s)
@@ -701,8 +767,35 @@ def main():
     assert not (after & {85, 86, 87}), \
         f"旧跳转窗口残留：{sorted(after & set(range(80, 100)))}"
     assert h_sched.cleared >= 1, "seek 未清理旧 deadline"
-    assert after >= {96, 97, 98, 99}, "清理后未重建尾部 moov 窗口"
+    assert after >= {98, 99}, "清理后未重建尾部 moov 窗口"
     print("[3c3] 调度器预约窗口通过：seek 立即预约 / 点播有上限 / 窗口随播放位置滚动 / 跳转清理残留")
+
+    # ---------------- [3c4] 阶段 B：stop(release_only)（迅雷式转正生命周期） ----------------
+    # release_only=True：只清 deadline + 还原调度锚点——**不** pause、**不**清文件
+    # 优先级、**不**撤 auto_managed（转正后引擎继续按 file-priority 4 全量缓存）。
+    h_rel = _FakeHandle(pl_s, 3)
+    sched = PreviewScheduler()
+    sched.begin(h_rel, f_sched)
+    h_rel.prios = None                      # 探针：begin 后清计数（begin 曾置 [4,0,0]/撤 upload_mode）
+    h_rel.unset_calls.clear()
+    sched.stop(release_only=True)
+    assert h_rel.paused_n == 0, "release_only 不应 pause"
+    assert h_rel.prios is None, "release_only 不应清文件优先级"
+    assert h_rel.unset_calls == [], "release_only 不应撤 auto_managed"
+    assert h_rel.cleared >= 1, "release_only 必须清 deadline"
+    assert sched.handle is None and sched.file is None \
+        and sched._scheduled_to == -1 and sched._tail_pieces == [], \
+        "release_only 锚点状态未还原"
+    # 默认参数（hold 档）：pause 一次 + 全 0 优先级 + 撤 auto_managed——基线逐字一致
+    h_hold = _FakeHandle(pl_s, 3)
+    sched = PreviewScheduler()
+    sched.begin(h_hold, f_sched)
+    h_hold.prios = None
+    sched.stop()
+    assert h_hold.paused_n == 1, "stop() 默认参数必须 pause（基线）"
+    assert h_hold.prios == [0, 0, 0], f"stop() 默认参数必须全 0 优先级：{h_hold.prios}"
+    assert h_hold.unset_calls, "stop() 默认参数必须撤 auto_managed"
+    print("[3c4] stop(release_only) 通过：release 只清锚点不冻结，默认参数基线逐字不变")
 
     # 分块映射：连续前缀 + 任意区间可用性（moov 在尾部的判定基础）
     pl, size = 16 * 1024, 300 * 1024
@@ -745,6 +838,10 @@ def main():
     except urllib.error.HTTPError as e:
         assert e.code == 416 and e.headers.get("Content-Range") == f"bytes */{size}", \
             (e.code, e.headers.get("Content-Range"))
+        # A3：HTTP/1.1 keep-alive 下 416 必须带 Content-Length: 0，
+        # 否则复用连接上的后续响应帧错位
+        assert e.headers.get("Content-Length") == "0", \
+            ("416 缺少 Content-Length: 0", dict(e.headers))
     srv3.shutdown()
     print("[3e] 分块级流服务通过：206 就绪区间 / 416 空洞 / 后缀相对逻辑大小")
 

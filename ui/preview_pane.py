@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPushButton,
 from core.models import TorrentFile, human_size
 from ui.gallery import GalleryWidget
 from ui.preview_player import VideoPreviewWidget
+from ui.theme import SP_XS
 
 PAGE_VIDEO, PAGE_GALLERY = 0, 1
 
@@ -25,7 +26,8 @@ class PreviewPane(QWidget):
         self.stack.addWidget(self.gallery)    # PAGE_GALLERY
 
         self.title = QLabel("（未选择文件）")
-        self.title.setStyleSheet("padding:4px 2px; font-weight:500;")
+        # 样式统一由 ui/theme.py 的 #playerTitle 给（本文件不写内联样式）
+        self.title.setObjectName("playerTitle")
         self.btn_to_download = QPushButton("转为下载")
         self.btn_to_download.setFixedWidth(88)
         self.btn_to_download.setToolTip(
@@ -38,6 +40,8 @@ class PreviewPane(QWidget):
         self.btn_stop.clicked.connect(self.stop_requested.emit)
 
         bar = QHBoxLayout()
+        # 标题行内边距（视觉规格 +4px）：标题与下方内容之间有呼吸感
+        bar.setContentsMargins(0, SP_XS, 0, SP_XS)
         bar.addWidget(self.title, 1)
         bar.addWidget(self.btn_to_download)
         bar.addWidget(self.btn_stop)

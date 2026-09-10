@@ -1,7 +1,12 @@
-"""16 套测试回归运行器：一键全量回归，汇总退出码。
+"""20 套测试回归运行器：一键全量回归，汇总退出码。
 
 依据 README.md 退出码约定与 t4_acceptance_plan.md 回归契约（D4）：
-下载管理模块改造后必须保证 8 套旧测试全绿（0=通过 / 1=失败 / 2=SKIP）。
+- 下载管理模块改造后必须保证 8 套旧测试全绿（0=通过 / 1=失败 / 2=SKIP）。
+
+末位 `close_lag_test`（plan 阶段 A + 阶段 A 审查整改）守关闭路径：首次
+close() 必须 <200ms 返回、遮罩可见、后台收尾各动作恰好一次（C1 快照取自
+shutdown 之前）、硬超时**自动**触发关窗、停机窗口内 22 个入口/桥回调全部
+守卫早退、遮罩绘制/跟动、closeEvent 逆常回退、重复关闭幂等。
 
 套件构成：第 1 套 `contract_check` 为对外契约自检（秒级，不启会话；
 拆分 `core/fetcher.py` 期间用它守住 23 个公开接口与协作模块签名）；
@@ -13,7 +18,7 @@ SKIP 判定（REVIEW-2026-09 P0-3）：部分套件因依赖缺失显式跳过�
 绝不能打印「回归全绿」。
 
 用法：
-    python regression_run.py            # 全量 16 套
+    python regression_run.py            # 全量 19 套
     python regression_run.py smoke      # 单套（按名字前缀匹配）
 
 退出码：任一测试 FAIL(1) → 本脚本退出 1；全部通过(0) → 0；
@@ -32,12 +37,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # 其后 7 套 = 旧测试兼容契约；末套 = 下载管理模块验收
 SUITES = [
     "contract_check",
+    "theme_check",          # 主题门禁：色值/内联样式只许在 ui/theme.py（plan B4）
     "persist_test",       # 阶段 1 持久化专项（假依赖，秒级，先跑最便宜的失败信号）
     "session_test",       # 阶段 2 会话核心专项（假依赖，秒级）
     "registry_test",      # 阶段 3 注册表与锁归属专项（假句柄，秒级）
     "taskops_test",       # 阶段 4 任务 CRUD 专项（假句柄+真注册表，秒级）
     "resolver_test",      # 阶段 5 解析与元数据编排专项（假会话，秒级）
     "preview_test",       # 阶段 5 预览桥与状态专项（假句柄，秒级）
+    "playback_window_test",  # plan/07 阶段 1 播放窗口按字节+deadline 递增（假句柄，秒级）
     "smoke_test",
     "local_magnet_test",
     "local_torrent_test",
@@ -47,6 +54,8 @@ SUITES = [
     "moov_stream_test",
     "qt_stream_open_test",
     "download_mgr_test",
+    "cache_mode_e2e_test",  # plan/06 缓存模式真链路：转正/续传/清理保护（真 libtorrent）
+    "close_lag_test",       # plan 阶段 A：关窗异步化（遮罩/后台收尾/硬超时兜底）
 ]
 
 NAME = {
