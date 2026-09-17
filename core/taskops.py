@@ -303,7 +303,11 @@ class TaskOps:
                     prio = [by_index.get(i, 0) for i in range(ti.num_files())]
                     rec.handle.prioritize_files(prio)
             if rec.priority and rec.priority > 0:
-                rec.handle.torrent_priority(lt_priority(rec.priority))
+                # libtorrent 2.x 的 torrent_handle 没有 torrent_priority()
+                # （2.0.14 / 2.1.1 实测均无此方法）：旧写法调用即抛
+                # AttributeError，被 except 吞掉 → 任务优先级**从未生效**。
+                # 正确 API 是 set_priority(0~255)。
+                rec.handle.set_priority(lt_priority(rec.priority))
             rec.handle.resume()
         except Exception as e:
             log_warning("fetcher.activate_download", f"{e}")
@@ -334,7 +338,8 @@ class TaskOps:
                 return False
             rec.priority = p
             try:
-                rec.handle.torrent_priority(lt_priority(p))
+                # 同上：必须是 set_priority（2.x 无 torrent_priority）
+                rec.handle.set_priority(lt_priority(p))
             except Exception as e:
                 log_warning("fetcher.set_priority", f"{e}")
             if key in reg.tasks:
