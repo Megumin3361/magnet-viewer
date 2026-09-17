@@ -62,6 +62,16 @@ def ensure_cache_dir(path: str) -> None:
     """
     if is_risky_dir(path):
         raise ValueError(f"缓存目录不允许是磁盘根目录或用户数据目录：{path}")
+    # P2-3：路径本身可能是 junction/symlink（词法校验看不见真实落点）。
+    # realpath 解析后若与词法路径不同（发生了链接跳转）且真实落点是高风险
+    # 目录 → 拒绝，防止「缓存目录 = ~/Documents 的链接」骗过清理守卫。
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        real = path                     # 解析失败（权限等）→ 维持原词法结论
+    if (os.path.normcase(real) != os.path.normcase(os.path.normpath(path))
+            and is_risky_dir(real)):
+        raise ValueError(f"缓存目录是指向用户数据目录的链接/挂载点：{path} -> {real}")
     os.makedirs(path, exist_ok=True)
     marker = os.path.join(path, CACHE_MARKER)
     if not os.path.isfile(marker):

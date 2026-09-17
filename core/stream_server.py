@@ -22,8 +22,9 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .logutil import log_warning
-from .models import contiguous_bytes, range_available, ready_until
+from .logutil import log_exception, log_warning
+from .models import (contiguous_bytes, is_within_root, range_available,
+                     ready_until)
 
 CHUNK = 256 * 1024
 
@@ -45,17 +46,12 @@ ALLOWED_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
 def _is_within(root: str, path: str) -> bool:
-    """path 是否严格位于 root 之内（防目录穿越，兼容 Windows 大小写差异）。
+    """path 是否严格位于 root 之内（防目录穿越 / 链接逃逸）。
 
-    内部先 normpath 再比前缀：调用方即使忘了规范化，含 `..` 的输入
-    （commonpath 会把 `..` 当普通段匹配到 root 自身）也无法绕过。
+    实现收敛到 models.is_within_root（词法+realpath 双重校验，P2-3）；
+    本函数名保留为模块级契约（smoke_test 直接引用）。
     """
-    try:
-        root_n = os.path.normcase(os.path.normpath(root))
-        return os.path.commonpath([root_n,
-                                   os.path.normcase(os.path.normpath(path))]) == root_n
-    except ValueError:  # 不同盘符 → commonpath 抛错，视为越界
-        return False
+    return is_within_root(root, path)
 
 
 class _StreamHandler(BaseHTTPRequestHandler):
@@ -419,4 +415,6 @@ class StreamServer:
             self._httpd.shutdown()
             self._httpd.server_close()
         except Exception:
-            pass
+            # 关闭路径的静默吞异常会掩盖「端口未释放/句柄泄漏」类问题，
+            # 至少留痕（logutil 自身异常安全，不会反向打断关闭流程）
+            log_exception("stream.shutdown")

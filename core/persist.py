@@ -20,7 +20,7 @@ from typing import Any, Callable
 import libtorrent as lt
 
 from .logutil import log_exception, log_warning
-from .models import safe_rel_path
+from .models import is_within_root, safe_rel_path
 from .parser import is_torrent_path
 from .resume import resume_path, write_resume
 from .states import (BOOTSTRAP_TRACKERS, DOWNLOAD_STATES, STATE_COMPLETED,
@@ -43,17 +43,13 @@ def is_resume_key(key: str) -> bool:
 
 
 def is_within(root: str, path: str) -> bool:
-    """path 是否位于 root 内（normcase + commonpath 前缀防护）。
+    """path 是否位于 root 内——收敛到 models.is_within_root（词法+realpath
+    双重校验，P2-3）；本包装额外先 abspath（既有调用语义）。
 
-    注意：``startswith`` 式前缀判断会被同前缀兄弟目录绕过
+    历史注意：``startswith`` 式前缀判断会被同前缀兄弟目录绕过
     （``cacheT`` vs ``cacheT_evil``），必须走 commonpath。
     """
-    root_n = os.path.normcase(os.path.normpath(os.path.abspath(root)))
-    path_n = os.path.normcase(os.path.normpath(os.path.abspath(path)))
-    try:
-        return os.path.commonpath([root_n, path_n]) == root_n
-    except ValueError:
-        return False
+    return is_within_root(os.path.abspath(root), os.path.abspath(path))
 
 
 def task_dir(download_dir: str, ih: str, save_subdir: str | None = None) -> str:

@@ -91,6 +91,37 @@ class ParseResult:
         return [f for f in self.files if f.is_video and not f.is_pad]
 
 
+def is_within_root(root: str, path: str) -> bool:
+    """path 是否严格位于 root 之内——全项目唯一的越界判定出口。
+
+    词法+realpath 双重校验（audit P2-3）：
+    1. 词法：normpath 后再比 commonpath，调用方即使忘了规范化，含 ``..``
+       的输入（commonpath 会把 ``..`` 当普通段匹配到 root 自身）也无法绕过；
+       不同盘符时 commonpath 抛 ValueError → 越界。
+    2. realpath：reparse point（Windows junction/symlink、POSIX symlink）
+       在 OS 层解析到根外时，词法过关但真实落点越界 → 拒绝。realpath 对
+       不存在的路径会解析最长已存在前缀，可接受；解析自身失败（权限等）
+       退回已通过的词法结论，不抛错、不误伤合法请求。
+
+    stream_server（供给边界）、persist/fetcher（删任务边界）、cache_guard
+    语义一致——历史上多处同型实现是缺陷温床（同一功能不同入口的覆盖教训）。
+    """
+    try:
+        root_n = os.path.normcase(os.path.normpath(root))
+        if os.path.commonpath([root_n,
+                               os.path.normcase(os.path.normpath(path))]) != root_n:
+            return False
+    except ValueError:  # 不同盘符 → commonpath 抛错，视为越界
+        return False
+    try:
+        root_r = os.path.normcase(os.path.realpath(root))
+        path_r = os.path.normcase(os.path.realpath(path))
+        return os.path.commonpath([root_r, path_r]) == root_r
+    except (OSError, ValueError):
+        # realpath 不可用/无权限/跨盘符 → 词法校验兜底（维持既有行为）
+        return True
+
+
 def safe_rel_path(*segments: str) -> str:
     """把种子里的路径段净化成安全相对路径（防御目录穿越）。
 

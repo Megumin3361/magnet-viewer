@@ -56,6 +56,7 @@ SUITES = [
     "download_mgr_test",
     "cache_mode_e2e_test",  # plan/06 缓存模式真链路：转正/续传/清理保护（真 libtorrent）
     "close_lag_test",       # plan 阶段 A：关窗异步化（遮罩/后台收尾/硬超时兜底）
+    "symlink_guard_test",   # P2-3：junction/symlink 逃逸双重校验（词法+realpath）
 ]
 
 NAME = {
