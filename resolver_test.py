@@ -93,7 +93,7 @@ class FakeHandle:
     def prioritize_files(self, prio):
         self.prioritized = prio
 
-    def torrent_priority(self, p):
+    def set_priority(self, p):
         self.tprio = p
 
 

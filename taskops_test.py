@@ -8,7 +8,7 @@ CRUD 的每条分支压一遍，秒级、不联网。
 - §A add_task 入参防御（空源 / 会话未启动 / 磁力链无效）
 - §B review 记录转正（D10，两条入口）：convert 在锁内路由、清单 upsert
 - §C activate_download：upload_mode 解除 + auto_managed + 文件优先级 +
-     所选过滤 + torrent_priority + resume 的调用序列；无句柄跳过；异常吞
+     所选过滤 + set_priority + resume 的调用序列；无句柄跳过；异常吞
 - §D 操作 API：set_priority（合法域/非法值/坏状态/句柄炸）、pause_task
      （撤 auto_managed + 清单 PAUSED + 请求 resume）、resume_task
      （元数据未就绪重启看门狗 / 已就绪回 DOWNLOADING）
@@ -107,7 +107,7 @@ class FakeHandle:
     def have_piece(self, piece):
         return False                  # 无落盘：first_missing 即播放起点
 
-    def torrent_priority(self, p):
+    def set_priority(self, p):
         self.torrent_priorities.append(p)
 
     def torrent_file(self):
@@ -309,7 +309,7 @@ def section_activate(ck):
         rec2 = TaskRecord(handle=h2, result=result, priority=0)
         ops.activate_download(rec2)
         ck.check(h2.prioritized == [[4, 4]], "无 selected 清单 → 全选 4")
-        ck.check(h2.torrent_priorities == [], "priority=0 不调 torrent_priority")
+        ck.check(h2.torrent_priorities == [], "priority=0 不调 set_priority")
         ops.activate_download(TaskRecord(handle=None))
         ck.check(True, "handle=None 安全跳过")
     finally:
@@ -337,14 +337,14 @@ def section_ops_api(ck):
         ck.check(ops.set_priority(IH2, 1) is False, "SEEDING 态不可改 → False")
 
         class BoomTp(FakeHandle):
-            def torrent_priority(self, p):
+            def set_priority(self, p):
                 raise RuntimeError("坏句柄")
         rec_b = add_rec(reg, "e" * 40, download=True,
                         state=STATE_DOWNLOADING)
         rec_b.handle = BoomTp("e" * 40)
         reg.tasks["e" * 40] = {"info_hash": "e" * 40}
         ck.check(ops.set_priority("e" * 40, 1) is True,
-                 "句柄 torrent_priority 炸：吞掉仍 True（状态已写）")
+                 "句柄 set_priority 炸：吞掉仍 True（状态已写）")
 
         # pause
         ck.check(ops.pause_task(IH) is True, "pause → True")
